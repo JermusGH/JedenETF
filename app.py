@@ -5,6 +5,7 @@ Run with:  streamlit run app.py
 """
 
 import re
+import urllib.parse
 
 import pandas as pd
 import streamlit as st
@@ -13,10 +14,87 @@ from etf_holdings import fetch_holdings
 from portfolio import TARGET_CURRENCY, fetch_prices, get_fund_family
 
 # ---------------------------------------------------------------------------
+# Provider detection helpers
+# ---------------------------------------------------------------------------
+
+_SUPPORTED_PROVIDERS = {"ishares", "vanguard", "amundi"}
+
+_GITHUB_REPO = "JermusGH/JedenETF"
+
+
+def _github_issue_url(title: str, body: str = "") -> str:
+    """Build a GitHub new-issue URL with pre-filled title and body."""
+    params = urllib.parse.urlencode({"title": title, "body": body})
+    return f"https://github.com/{_GITHUB_REPO}/issues/new?{params}"
+
+
+def _detect_ticker_provider(ticker: str) -> str:
+    """Detect the provider for a ticker. Returns 'ishares', 'vanguard', 'amundi', or 'unknown'."""
+    try:
+        family = get_fund_family(ticker).lower()
+        if "blackrock" in family or "ishares" in family:
+            return "ishares"
+        if "vanguard" in family:
+            return "vanguard"
+        if "amundi" in family:
+            return "amundi"
+    except Exception:
+        pass
+    return "unknown"
+
+
+def _validate_holdings_csv(file) -> tuple[pd.DataFrame | None, str]:
+    """
+    Validate an uploaded CSV file for custom holdings.
+
+    Expected format: CSV with columns 'ticker', 'name', 'weight'.
+    - ticker: stock ticker (string)
+    - name: company name (string)
+    - weight: percentage weight (numeric, e.g. 8.5 means 8.5%)
+
+    Returns (DataFrame, "") on success or (None, error_message) on failure.
+    """
+    try:
+        df = pd.read_csv(file)
+    except Exception as exc:
+        return None, f"Could not read CSV file: {exc}"
+
+    required_cols = {"ticker", "name", "weight"}
+    actual_cols = {c.strip().lower() for c in df.columns}
+    missing = required_cols - actual_cols
+    if missing:
+        return None, f"Missing required columns: {', '.join(sorted(missing))}. Expected: ticker, name, weight"
+
+    # Normalise column names
+    df.columns = [c.strip().lower() for c in df.columns]
+    df = df[["ticker", "name", "weight"]].copy()
+
+    # Validate data types
+    df["ticker"] = df["ticker"].astype(str).str.strip()
+    df["name"] = df["name"].astype(str).str.strip()
+    df["weight"] = pd.to_numeric(df["weight"], errors="coerce")
+
+    if df["weight"].isna().any():
+        bad_rows = df[df["weight"].isna()].index.tolist()
+        return None, f"Non-numeric values in 'weight' column at rows: {bad_rows}"
+
+    if (df["weight"] < 0).any():
+        return None, "Negative values found in 'weight' column."
+
+    if df["name"].eq("").any():
+        return None, "Empty values found in 'name' column."
+
+    df = df[df["weight"] > 0].reset_index(drop=True)
+    if df.empty:
+        return None, "No holdings with weight > 0 found in the file."
+
+    return df, ""
+
+# ---------------------------------------------------------------------------
 # Page config
 # ---------------------------------------------------------------------------
 
-st.set_page_config(page_title="Unified ETF Portfolio", page_icon="📊", layout="wide")
+st.set_page_config(page_title="Unified ETF Portfolio", layout="wide")
 
 # ---------------------------------------------------------------------------
 # Company name normalisation
@@ -60,8 +138,13 @@ def run_analysis(portfolio: dict[str, float]) -> tuple[pd.DataFrame, float, list
             continue
 
         etf_value = units * price
-        fund_family = get_fund_family(ticker)
-        df = fetch_holdings(yf_ticker=ticker, fund_family=fund_family)
+
+        # Use custom uploaded holdings if available, otherwise fetch
+        if ticker in st.session_state.custom_holdings:
+            df = st.session_state.custom_holdings[ticker].copy()
+        else:
+            fund_family = get_fund_family(ticker)
+            df = fetch_holdings(yf_ticker=ticker, fund_family=fund_family)
 
         if df is None or df.empty:
             continue
@@ -114,48 +197,146 @@ if "portfolio" not in st.session_state:
 if "results" not in st.session_state:
     st.session_state.results = None
 
+if "amundi_tickers" not in st.session_state:
+    st.session_state.amundi_tickers = set()
+
+if "unsupported_tickers" not in st.session_state:
+    st.session_state.unsupported_tickers = set()
+
+if "custom_holdings" not in st.session_state:
+    st.session_state.custom_holdings = {}  # ticker -> pd.DataFrame
+
 
 # ---------------------------------------------------------------------------
 # Welcome screen / Portfolio editor
 # ---------------------------------------------------------------------------
 
 def show_portfolio_editor():
-    st.title("� Unified ETF Portfolio")
+    st.title("Unified ETF Portfolio")
     st.markdown(
         "See your true exposure across multiple ETFs. "
         "Add your holdings below, then click **Analyse** to merge them."
     )
 
     st.markdown("---")
+    with st.expander("How to use"):
+        st.markdown(
+            "**This tool supports European-listed ETFs only** (e.g. London, Frankfurt, Amsterdam).\n\n"
+            "1. Enter the ETF ticker from Yahoo Finance including the exchange suffix "
+            "(e.g. `CSPX.L` for London, `VWCE.DE` for Frankfurt, `CNDX.AS` for Amsterdam).\n"
+            "2. Specify the number of shares you hold.\n"
+            "3. Click **Add** to add the position to your portfolio.\n"
+            "4. Once all ETFs are added, click **Analyse Portfolio** to see "
+            "your true exposure across individual companies.\n\n"
+            "**Note:** The exchange suffix (`.L`, `.DE`, `.AS`, etc.) is required. "
+            "Without it, the tool cannot identify the correct ETF listing.\n\n"
+            "**Unsupported providers:** If your ETF provider is not natively supported "
+            "(iShares, Vanguard, Amundi), you can upload a custom holdings CSV file. "
+            "The file must contain columns: `ticker`, `name`, `weight` "
+            "(where weight is a percentage, e.g. 8.5 means 8.5%)."
+        )
+
+    # Warnings section
+    warnings = []
+    for t in st.session_state.amundi_tickers:
+        if t in st.session_state.portfolio:
+            warnings.append(
+                f"**{t}** — Amundi ETF: only top 10 holdings will be used in the analysis. "
+                f"You can upload a full holdings CSV using the upload button next to the ticker."
+            )
+    for t in st.session_state.unsupported_tickers:
+        if t in st.session_state.portfolio:
+            issue_url = _github_issue_url(
+                title=f"Add support for provider: {t}",
+                body=f"Ticker: {t}\nProvider: unknown\n\nPlease add full holdings support for this ETF provider.",
+            )
+            warnings.append(
+                f"**{t}** — unsupported provider. Only top 10 holdings will be used. "
+                f"You can upload a full holdings CSV using the upload button next to the ticker. "
+                f"[Request provider support]({issue_url})"
+            )
+
+    if warnings:
+        st.markdown("---")
+        st.subheader("Warnings")
+        for w in warnings:
+            st.warning(w)
+
+    st.markdown("---")
     st.subheader("Your ETFs")
+
+    # Column headers
+    col_h1, col_h2, col_h3, col_h4, col_h5 = st.columns([3, 2, 0.3, 0.3, 0.3])
+    col_h1.markdown("**Yahoo Finance ticker**")
+    col_h2.markdown("**Number of shares**")
 
     # Show existing entries
     to_remove = []
     for ticker, units in st.session_state.portfolio.items():
-        col1, col2, col3 = st.columns([3, 2, 1])
+        col1, col2, col3, col4, col5 = st.columns([3, 2, 0.3, 0.3, 0.3])
         col1.text_input("Ticker", value=ticker, disabled=True, key=f"disp_{ticker}", label_visibility="collapsed")
         new_val = col2.number_input(
             "Units", value=float(units), min_value=0.0, step=0.1,
             key=f"val_{ticker}", label_visibility="collapsed"
         )
         st.session_state.portfolio[ticker] = new_val
+
         if col3.button("✕", key=f"rm_{ticker}"):
             to_remove.append(ticker)
 
+        # Upload button for unsupported/limited providers
+        if ticker in st.session_state.unsupported_tickers or ticker in st.session_state.amundi_tickers:
+            with col4.popover("↑", use_container_width=True):
+                st.markdown("**Upload holdings CSV**")
+                st.caption("Columns: `ticker`, `name`, `weight`")
+                uploaded = st.file_uploader(
+                    "CSV file",
+                    type=["csv"],
+                    key=f"upload_{ticker}",
+                    label_visibility="collapsed",
+                )
+                if uploaded is not None and ticker not in st.session_state.custom_holdings:
+                    df, error = _validate_holdings_csv(uploaded)
+                    if error:
+                        st.error(error)
+                    else:
+                        st.session_state.custom_holdings[ticker] = df
+                        st.rerun()
+
+            # Green tick if data loaded
+            if ticker in st.session_state.custom_holdings:
+                col5.markdown(
+                    "<span style='color: green; font-size: 1.5rem;'>&#10004;</span>",
+                    unsafe_allow_html=True,
+                )
+
     for t in to_remove:
         del st.session_state.portfolio[t]
+        st.session_state.amundi_tickers.discard(t)
+        st.session_state.unsupported_tickers.discard(t)
+        st.session_state.custom_holdings.pop(t, None)
         st.rerun()
 
-    # Add new ETF
-    st.markdown("---")
-    st.subheader("Add ETF")
-    col_a, col_b, col_c = st.columns([3, 2, 1])
-    new_ticker = col_a.text_input("Yahoo Finance ticker", placeholder="e.g. CSPX.L, VWCE.DE", key="new_ticker")
-    new_units = col_b.number_input("Number of shares", value=0.0, min_value=0.0, step=0.1, key="new_units")
-    if col_c.button("Add", type="primary"):
+    # Input row at the bottom — moves down as entries are added
+    col_a, col_b, col_c, _, _ = st.columns([3, 2, 0.3, 0.3, 0.3])
+    new_ticker = col_a.text_input("Ticker input", placeholder="e.g. CSPX.L, VWCE.DE", key="new_ticker", label_visibility="collapsed")
+    new_units = col_b.number_input("Units input", value=0.0, min_value=0.0, step=0.1, key="new_units", label_visibility="collapsed")
+    if col_c.button("Add", type="primary", key="add_btn"):
         if new_ticker and new_units > 0:
-            st.session_state.portfolio[new_ticker.strip().upper()] = new_units
-            st.rerun()
+            clean_ticker = new_ticker.strip().upper()
+            if "." not in clean_ticker:
+                st.warning(
+                    "Ticker is missing an exchange suffix (e.g. `.L`, `.DE`, `.AS`). "
+                    "Please use the full Yahoo Finance ticker format."
+                )
+            else:
+                st.session_state.portfolio[clean_ticker] = new_units
+                provider = _detect_ticker_provider(clean_ticker)
+                if provider == "amundi":
+                    st.session_state.amundi_tickers.add(clean_ticker)
+                elif provider not in _SUPPORTED_PROVIDERS:
+                    st.session_state.unsupported_tickers.add(clean_ticker)
+                st.rerun()
         else:
             st.warning("Enter a ticker and units > 0")
 
@@ -165,13 +346,32 @@ def show_portfolio_editor():
 
     if active:
         st.info(f"**{len(active)} ETFs** ready for analysis")
-        if st.button("🚀 Analyse Portfolio", type="primary", use_container_width=True):
+        if st.button("Analyse Portfolio", type="primary", use_container_width=True):
             with st.spinner("Fetching data..."):
                 final_df, total_value, sources = run_analysis(active)
             st.session_state.results = (final_df, total_value, sources)
             st.rerun()
     else:
         st.caption("Add at least one ETF to get started.")
+
+    # Suggest Improvement section
+    st.markdown("---")
+    st.subheader("Suggest Improvement")
+    st.markdown("Have an idea or want support for a new ETF provider? Open a GitHub issue:")
+
+    col_s1, col_s2 = st.columns(2)
+    with col_s1:
+        provider_url = _github_issue_url(
+            title="Add support for new provider",
+            body="Provider name: \nExample ticker: \n\nPlease add support for this ETF provider.",
+        )
+        st.link_button("Request new provider", provider_url)
+    with col_s2:
+        suggestion_url = _github_issue_url(
+            title="Suggestion: ",
+            body="Describe your suggestion here:\n\n",
+        )
+        st.link_button("Suggest a change", suggestion_url)
 
 
 # ---------------------------------------------------------------------------
@@ -189,7 +389,7 @@ def show_results():
         return
 
     # Header
-    st.title("📊 Portfolio Analysis")
+    st.title("Portfolio Analysis")
     if st.button("← Edit Portfolio"):
         st.session_state.results = None
         st.rerun()
