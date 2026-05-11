@@ -1,5 +1,6 @@
 unified_etf_results.csv
 unified_etf_summary.txt
+.etf_cache.json
 ETF exports/*
 
 # Byte-compiled / optimized / DLL files
