@@ -197,6 +197,7 @@ def test_property_3_provider_detection_keyword_logic(fund_family: str):
     For any fund family string, the provider classification SHALL be:
     - "ishares" if the lowercased string contains "blackrock" or "ishares"
     - "vanguard" if the lowercased string contains "vanguard"
+    - "invesco" if the lowercased string contains "invesco"
     - "amundi" if the lowercased string contains "amundi"
     - "unknown" otherwise
     """
@@ -210,6 +211,10 @@ def test_property_3_provider_detection_keyword_logic(fund_family: str):
     elif "vanguard" in lowered:
         assert result == "vanguard", (
             f"Expected 'vanguard' for fund_family={fund_family!r}, got {result!r}"
+        )
+    elif "invesco" in lowered:
+        assert result == "invesco", (
+            f"Expected 'invesco' for fund_family={fund_family!r}, got {result!r}"
         )
     elif "amundi" in lowered:
         assert result == "amundi", (

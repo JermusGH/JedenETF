@@ -10,7 +10,7 @@ import pandas as pd
 import streamlit as st
 
 from analysis import enrich_holdings, merge_holdings
-from etf_holdings import fetch_holdings
+from etf_holdings import clear_justetf_tickers, fetch_holdings, get_justetf_tickers
 from name_normaliser import normalise_name
 from portfolio import SUPPORTED_CURRENCIES, TARGET_CURRENCY, fetch_prices, get_fund_family
 from validation import validate_holdings_csv, validate_ticker
@@ -19,7 +19,7 @@ from validation import validate_holdings_csv, validate_ticker
 # Provider detection helpers
 # ---------------------------------------------------------------------------
 
-_SUPPORTED_PROVIDERS = {"ishares", "vanguard", "amundi"}
+_SUPPORTED_PROVIDERS = {"ishares", "vanguard", "invesco", "xtrackers", "amundi"}
 
 _GITHUB_REPO = "JermusGH/JedenETF"
 
@@ -31,13 +31,17 @@ def _github_issue_url(title: str, body: str = "") -> str:
 
 
 def _detect_ticker_provider(ticker: str) -> str:
-    """Detect the provider for a ticker. Returns 'ishares', 'vanguard', 'amundi', or 'unknown'."""
+    """Detect the provider for a ticker. Returns 'ishares', 'vanguard', 'invesco', 'xtrackers', 'amundi', or 'unknown'."""
     try:
         family = get_fund_family(ticker).lower()
         if "blackrock" in family or "ishares" in family:
             return "ishares"
         if "vanguard" in family:
             return "vanguard"
+        if "invesco" in family:
+            return "invesco"
+        if "dws" in family or "xtrackers" in family:
+            return "xtrackers"
         if "amundi" in family:
             return "amundi"
     except Exception:
@@ -59,13 +63,19 @@ st.set_page_config(page_title="Unified ETF Portfolio", layout="wide")
 # Analysis logic
 # ---------------------------------------------------------------------------
 
-def run_analysis(portfolio: dict[str, float], target_currency: str = "PLN") -> tuple[pd.DataFrame, float, list[str]]:
-    """Fetch prices and holdings, merge into unified DataFrame."""
+def run_analysis(portfolio: dict[str, float], target_currency: str = "PLN") -> tuple[pd.DataFrame, float, list[str], list[str], list[str]]:
+    """Fetch prices and holdings, merge into unified DataFrame.
+
+    Returns (final_df, total_value, sources, failed_tickers, justetf_tickers).
+    """
     tickers = list(portfolio.keys())
     prices = fetch_prices(tickers, target_currency=target_currency)
 
     frames: list[pd.DataFrame] = []
     total_value = 0.0
+    failed_tickers: list[str] = []
+
+    clear_justetf_tickers()
 
     progress = st.progress(0, text="Loading holdings...")
     for i, (ticker, units) in enumerate(portfolio.items()):
@@ -75,6 +85,7 @@ def run_analysis(portfolio: dict[str, float], target_currency: str = "PLN") -> t
             continue
         price = prices.get(ticker)
         if price is None:
+            failed_tickers.append(ticker)
             continue
 
         etf_value = units * price
@@ -87,6 +98,7 @@ def run_analysis(portfolio: dict[str, float], target_currency: str = "PLN") -> t
             df = fetch_holdings(yf_ticker=ticker, fund_family=fund_family)
 
         if df is None or df.empty:
+            failed_tickers.append(ticker)
             continue
 
         enriched = enrich_holdings(df, etf_value, ticker)
@@ -95,13 +107,15 @@ def run_analysis(portfolio: dict[str, float], target_currency: str = "PLN") -> t
 
     progress.empty()
 
+    justetf_tickers = sorted(get_justetf_tickers())
+
     if not frames or total_value == 0:
-        return pd.DataFrame(), 0.0, []
+        return pd.DataFrame(), 0.0, [], failed_tickers, justetf_tickers
 
     sources = sorted(set(s for f in frames for s in f["source"].unique()))
     final = merge_holdings(frames, total_value)
     final = final.sort_values("weight_%", ascending=False)
-    return final, total_value, sources
+    return final, total_value, sources, failed_tickers, justetf_tickers
 
 
 # ---------------------------------------------------------------------------
@@ -170,10 +184,19 @@ def show_portfolio_editor():
             "your true exposure across individual companies.\n\n"
             "**Note:** The exchange suffix (`.L`, `.DE`, `.AS`, etc.) is required. "
             "Without it, the tool cannot identify the correct ETF listing.\n\n"
-            "**Unsupported providers:** If your ETF provider is not natively supported "
-            "(iShares, Vanguard, Amundi), you can upload a custom holdings CSV file. "
-            "The file must contain columns: `ticker`, `name`, `weight` "
-            "(where weight is a percentage, e.g. 8.5 means 8.5%)."
+            "---\n\n"
+            "**Provider support levels:**\n\n"
+            "| Level | Providers | Holdings |\n"
+            "|-------|-----------|----------|\n"
+            "| Full | iShares (BlackRock), Vanguard, Invesco, Xtrackers (DWS) | All holdings |\n"
+            "| Limited | Amundi | Top 10 via justETF or upload CSV |\n"
+            "| Unsupported | All others | Top 10 via justETF or upload CSV |\n\n"
+            "For limited/unsupported providers you can upload a custom holdings CSV file "
+            "with columns: `ticker`, `name`, `weight` "
+            "(where weight is a percentage, e.g. 8.5 means 8.5%).\n\n"
+            "---\n\n"
+            "**Not supported:** Swap-based, money market, and commodity ETFs (e.g. XEON, XEOD) "
+            "do not hold individual securities and cannot be analysed by this tool."
         )
 
     # Warnings section
@@ -191,7 +214,7 @@ def show_portfolio_editor():
                 body=f"Ticker: {t}\nProvider: unknown\n\nPlease add full holdings support for this ETF provider.",
             )
             warnings.append(
-                f"**{t}** — unsupported provider. Only top 10 holdings will be used. "
+                f"**{t}** — unsupported provider. Only top 10 holdings will be used (via justETF). "
                 f"You can upload a full holdings CSV using the upload button next to the ticker. "
                 f"[Request provider support]({issue_url})"
             )
@@ -284,8 +307,8 @@ def show_portfolio_editor():
         st.info(f"**{len(active)} ETFs** ready for analysis")
         if st.button("Analyse Portfolio", type="primary", use_container_width=True):
             with st.spinner("Fetching data..."):
-                final_df, total_value, sources = run_analysis(active, target_currency=st.session_state.target_currency)
-            st.session_state.results = (final_df, total_value, sources)
+                final_df, total_value, sources, failed, justetf = run_analysis(active, target_currency=st.session_state.target_currency)
+            st.session_state.results = (final_df, total_value, sources, failed, justetf)
             st.rerun()
     else:
         st.caption("Add at least one ETF to get started.")
@@ -315,10 +338,26 @@ def show_portfolio_editor():
 # ---------------------------------------------------------------------------
 
 def show_results():
-    final_df, total_value, sources = st.session_state.results
+    result_data = st.session_state.results
+    # Support old (3-tuple), mid (4-tuple), and new (5-tuple) format
+    if len(result_data) == 5:
+        final_df, total_value, sources, failed_tickers, justetf_tickers = result_data
+    elif len(result_data) == 4:
+        final_df, total_value, sources, failed_tickers = result_data
+        justetf_tickers = []
+    else:
+        final_df, total_value, sources = result_data
+        failed_tickers = []
+        justetf_tickers = []
 
     if final_df.empty:
         st.error("Could not fetch holdings for any ETF. Check tickers and internet connection.")
+        if failed_tickers:
+            st.warning(
+                f"**Failed tickers:** {', '.join(failed_tickers)}\n\n"
+                "Swap-based, money market, and commodity ETFs do not hold individual "
+                "securities and cannot be analysed by this tool."
+            )
         if st.button("← Back to editor"):
             st.session_state.results = None
             st.rerun()
@@ -329,6 +368,22 @@ def show_results():
     if st.button("← Edit Portfolio"):
         st.session_state.results = None
         st.rerun()
+
+    # Warning for failed tickers
+    if failed_tickers:
+        st.warning(
+            f"**Skipped:** {', '.join(failed_tickers)} — no holdings data available. "
+            "Swap-based, money market, and commodity ETFs do not hold individual "
+            "securities and cannot be analysed."
+        )
+
+    # Warning for justETF fallback tickers
+    if justetf_tickers:
+        st.info(
+            f"**Top 10 only (via justETF):** {', '.join(justetf_tickers)} — "
+            "full holdings are not available for these ETFs. "
+            "Only the top 10 positions are included in the analysis."
+        )
 
     # Metrics
     st.markdown("---")
