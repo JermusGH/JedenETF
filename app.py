@@ -4,14 +4,16 @@ Unified ETF Portfolio Dashboard — Streamlit App
 Run with:  streamlit run app.py
 """
 
-import re
 import urllib.parse
 
 import pandas as pd
 import streamlit as st
 
+from analysis import enrich_holdings, merge_holdings
 from etf_holdings import fetch_holdings
-from portfolio import TARGET_CURRENCY, fetch_prices, get_fund_family
+from name_normaliser import normalise_name
+from portfolio import SUPPORTED_CURRENCIES, TARGET_CURRENCY, fetch_prices, get_fund_family
+from validation import validate_holdings_csv, validate_ticker
 
 # ---------------------------------------------------------------------------
 # Provider detection helpers
@@ -44,51 +46,8 @@ def _detect_ticker_provider(ticker: str) -> str:
 
 
 def _validate_holdings_csv(file) -> tuple[pd.DataFrame | None, str]:
-    """
-    Validate an uploaded CSV file for custom holdings.
-
-    Expected format: CSV with columns 'ticker', 'name', 'weight'.
-    - ticker: stock ticker (string)
-    - name: company name (string)
-    - weight: percentage weight (numeric, e.g. 8.5 means 8.5%)
-
-    Returns (DataFrame, "") on success or (None, error_message) on failure.
-    """
-    try:
-        df = pd.read_csv(file)
-    except Exception as exc:
-        return None, f"Could not read CSV file: {exc}"
-
-    required_cols = {"ticker", "name", "weight"}
-    actual_cols = {c.strip().lower() for c in df.columns}
-    missing = required_cols - actual_cols
-    if missing:
-        return None, f"Missing required columns: {', '.join(sorted(missing))}. Expected: ticker, name, weight"
-
-    # Normalise column names
-    df.columns = [c.strip().lower() for c in df.columns]
-    df = df[["ticker", "name", "weight"]].copy()
-
-    # Validate data types
-    df["ticker"] = df["ticker"].astype(str).str.strip()
-    df["name"] = df["name"].astype(str).str.strip()
-    df["weight"] = pd.to_numeric(df["weight"], errors="coerce")
-
-    if df["weight"].isna().any():
-        bad_rows = df[df["weight"].isna()].index.tolist()
-        return None, f"Non-numeric values in 'weight' column at rows: {bad_rows}"
-
-    if (df["weight"] < 0).any():
-        return None, "Negative values found in 'weight' column."
-
-    if df["name"].eq("").any():
-        return None, "Empty values found in 'name' column."
-
-    df = df[df["weight"] > 0].reset_index(drop=True)
-    if df.empty:
-        return None, "No holdings with weight > 0 found in the file."
-
-    return df, ""
+    """Validate an uploaded CSV file for custom holdings. Delegates to validation module."""
+    return validate_holdings_csv(file)
 
 # ---------------------------------------------------------------------------
 # Page config
@@ -97,32 +56,13 @@ def _validate_holdings_csv(file) -> tuple[pd.DataFrame | None, str]:
 st.set_page_config(page_title="Unified ETF Portfolio", layout="wide")
 
 # ---------------------------------------------------------------------------
-# Company name normalisation
-# ---------------------------------------------------------------------------
-
-_STRIP_SUFFIXES = re.compile(
-    r"\b(?:INC|CORP|CORPORATION|LTD|LIMITED|PLC|COMPANY|AG|SA|NV|"
-    r"GROUP|HOLDINGS|HOLDING|SE|CLASS\s+[A-C]|CL\s+[A-C]|CO(?!\w))\b"
-)
-
-
-def _normalise_name(name) -> str:
-    if pd.isna(name):
-        return ""
-    text = re.sub(r"[^\w\s]", "", str(name).upper())
-    text = _STRIP_SUFFIXES.sub("", text)
-    words = text.split()
-    return " ".join(words[:2])
-
-
-# ---------------------------------------------------------------------------
 # Analysis logic
 # ---------------------------------------------------------------------------
 
-def run_analysis(portfolio: dict[str, float]) -> tuple[pd.DataFrame, float, list[str]]:
+def run_analysis(portfolio: dict[str, float], target_currency: str = "PLN") -> tuple[pd.DataFrame, float, list[str]]:
     """Fetch prices and holdings, merge into unified DataFrame."""
     tickers = list(portfolio.keys())
-    prices = fetch_prices(tickers)
+    prices = fetch_prices(tickers, target_currency=target_currency)
 
     frames: list[pd.DataFrame] = []
     total_value = 0.0
@@ -149,41 +89,18 @@ def run_analysis(portfolio: dict[str, float]) -> tuple[pd.DataFrame, float, list
         if df is None or df.empty:
             continue
 
-        weight_sum = df["weight"].sum()
-        if weight_sum > 10:
-            df["value"] = (df["weight"] / 100.0) * etf_value
-        else:
-            df["value"] = df["weight"] * etf_value
-
-        df["source"] = ticker
-        df["merge_key"] = df["name"].apply(_normalise_name)
+        enriched = enrich_holdings(df, etf_value, ticker)
         total_value += etf_value
-        frames.append(df)
+        frames.append(enriched)
 
     progress.empty()
 
-    if not frames:
+    if not frames or total_value == 0:
         return pd.DataFrame(), 0.0, []
 
-    combined = pd.concat(frames, ignore_index=True)
-    sources = sorted(combined["source"].unique().tolist())
-
-    combined["_ticker_len"] = combined["ticker"].astype(str).str.len()
-    combined = combined.sort_values("_ticker_len")
-
-    grouped = (
-        combined.groupby("merge_key")
-        .agg(ticker=("ticker", "first"), name=("name", "first"), value=("value", "sum"))
-        .reset_index()
-    )
-    grouped["weight_%"] = (grouped["value"] / total_value) * 100.0
-
-    combined["contrib_%"] = (combined["value"] / total_value) * 100.0
-    pivot = combined.pivot_table(
-        index="merge_key", columns="source", values="contrib_%", aggfunc="sum", fill_value=0.0
-    ).reset_index()
-
-    final = grouped.merge(pivot, on="merge_key").sort_values("weight_%", ascending=False)
+    sources = sorted(set(s for f in frames for s in f["source"].unique()))
+    final = merge_holdings(frames, total_value)
+    final = final.sort_values("weight_%", ascending=False)
     return final, total_value, sources
 
 
@@ -205,6 +122,29 @@ if "unsupported_tickers" not in st.session_state:
 
 if "custom_holdings" not in st.session_state:
     st.session_state.custom_holdings = {}  # ticker -> pd.DataFrame
+
+if "target_currency" not in st.session_state:
+    st.session_state.target_currency = "PLN"
+
+if "_prev_target_currency" not in st.session_state:
+    st.session_state._prev_target_currency = st.session_state.target_currency
+
+# ---------------------------------------------------------------------------
+# Sidebar — Currency selector
+# ---------------------------------------------------------------------------
+
+st.session_state.target_currency = st.sidebar.selectbox(
+    "Target Currency",
+    options=SUPPORTED_CURRENCIES,
+    index=SUPPORTED_CURRENCIES.index(st.session_state.target_currency),
+)
+
+# Invalidate results when currency changes
+if st.session_state.target_currency != st.session_state._prev_target_currency:
+    st.session_state._prev_target_currency = st.session_state.target_currency
+    if st.session_state.results is not None:
+        st.session_state.results = None
+        st.rerun()
 
 
 # ---------------------------------------------------------------------------
@@ -322,23 +262,19 @@ def show_portfolio_editor():
     new_ticker = col_a.text_input("Ticker input", placeholder="e.g. CSPX.L, VWCE.DE", key="new_ticker", label_visibility="collapsed")
     new_units = col_b.number_input("Units input", value=0.0, min_value=0.0, step=0.1, key="new_units", label_visibility="collapsed")
     if col_c.button("Add", type="primary", key="add_btn"):
-        if new_ticker and new_units > 0:
-            clean_ticker = new_ticker.strip().upper()
-            if "." not in clean_ticker:
-                st.warning(
-                    "Ticker is missing an exchange suffix (e.g. `.L`, `.DE`, `.AS`). "
-                    "Please use the full Yahoo Finance ticker format."
-                )
-            else:
-                st.session_state.portfolio[clean_ticker] = new_units
-                provider = _detect_ticker_provider(clean_ticker)
-                if provider == "amundi":
-                    st.session_state.amundi_tickers.add(clean_ticker)
-                elif provider not in _SUPPORTED_PROVIDERS:
-                    st.session_state.unsupported_tickers.add(clean_ticker)
-                st.rerun()
+        cleaned_ticker, error = validate_ticker(new_ticker)
+        if error:
+            st.warning(error)
+        elif new_units <= 0:
+            st.warning("Please enter a number of shares greater than zero.")
         else:
-            st.warning("Enter a ticker and units > 0")
+            st.session_state.portfolio[cleaned_ticker] = new_units
+            provider = _detect_ticker_provider(cleaned_ticker)
+            if provider == "amundi":
+                st.session_state.amundi_tickers.add(cleaned_ticker)
+            elif provider not in _SUPPORTED_PROVIDERS:
+                st.session_state.unsupported_tickers.add(cleaned_ticker)
+            st.rerun()
 
     # Analyse button
     st.markdown("---")
@@ -348,7 +284,7 @@ def show_portfolio_editor():
         st.info(f"**{len(active)} ETFs** ready for analysis")
         if st.button("Analyse Portfolio", type="primary", use_container_width=True):
             with st.spinner("Fetching data..."):
-                final_df, total_value, sources = run_analysis(active)
+                final_df, total_value, sources = run_analysis(active, target_currency=st.session_state.target_currency)
             st.session_state.results = (final_df, total_value, sources)
             st.rerun()
     else:
@@ -397,7 +333,7 @@ def show_results():
     # Metrics
     st.markdown("---")
     col1, col2, col3 = st.columns(3)
-    col1.metric("Total Value", f"{total_value:,.0f} {TARGET_CURRENCY}")
+    col1.metric("Total Value", f"{total_value:,.0f} {st.session_state.target_currency}")
     col2.metric("Unique Holdings", f"{len(final_df):,}")
     col3.metric("ETFs Loaded", f"{len(sources)}")
 
@@ -407,11 +343,12 @@ def show_results():
 
     top20 = final_df.head(20).copy()
     display_df = top20[["ticker", "name", "weight_%", "value"]].copy()
-    display_df.columns = ["Ticker", "Company", "Weight (%)", f"Value ({TARGET_CURRENCY})"]
+    currency = st.session_state.target_currency
+    display_df.columns = ["Ticker", "Company", "Weight (%)", f"Value ({currency})"]
     display_df = display_df.reset_index(drop=True)
     display_df.index += 1
     st.dataframe(
-        display_df.style.format({"Weight (%)": "{:.2f}%", f"Value ({TARGET_CURRENCY})": "{:,.2f}"}),
+        display_df.style.format({"Weight (%)": "{:.2f}%", f"Value ({currency})": "{:,.2f}"}),
         use_container_width=True,
     )
 

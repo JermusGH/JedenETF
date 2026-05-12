@@ -14,6 +14,8 @@ from io import StringIO
 import pandas as pd
 import requests
 
+from validation import is_valid_isin
+
 try:
     from curl_cffi import requests as curl_requests
 except ImportError:
@@ -62,18 +64,34 @@ _VANGUARD_HEADERS = {
 # ---------------------------------------------------------------------------
 
 def _load_cache() -> dict:
-    if os.path.exists(_CACHE_PATH):
-        try:
-            with open(_CACHE_PATH, "r", encoding="utf-8") as fh:
-                return json.load(fh)
-        except (json.JSONDecodeError, OSError):
-            pass
-    return {}
+    """Load the discovery cache from disk.
+
+    Returns an empty dict if the file does not exist, contains malformed JSON,
+    is empty, or cannot be read for any reason (Requirement 12.6).
+    """
+    if not os.path.exists(_CACHE_PATH):
+        return {}
+    try:
+        with open(_CACHE_PATH, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+        if isinstance(data, dict):
+            return data
+        return {}
+    except Exception:
+        return {}
 
 
 def _save_cache(cache: dict) -> None:
-    with open(_CACHE_PATH, "w", encoding="utf-8") as fh:
-        json.dump(cache, fh, indent=2)
+    """Persist the discovery cache to disk.
+
+    Silently continues on any write failure so that analysis is never
+    interrupted by a caching error (Requirement 12.7).
+    """
+    try:
+        with open(_CACHE_PATH, "w", encoding="utf-8") as fh:
+            json.dump(cache, fh, indent=2)
+    except Exception:
+        pass
 
 
 # ---------------------------------------------------------------------------
@@ -106,11 +124,14 @@ def _discover_isin(yf_ticker: str) -> str | None:
     # Structured match near the ISIN label
     match = re.search(r"ISIN[^<]*<[^>]*>([A-Z]{2}[A-Z0-9]{10})", resp.text)
     if match:
-        return match.group(1)
+        candidate = match.group(1)
+        return candidate if is_valid_isin(candidate) else None
 
     # Fallback: find fund-domicile ISINs
     fund_isins = list(set(re.findall(r"\b((?:IE|LU)[A-Z0-9]{10})\b", resp.text)))
-    return fund_isins[0] if len(fund_isins) == 1 else None
+    if len(fund_isins) == 1 and is_valid_isin(fund_isins[0]):
+        return fund_isins[0]
+    return None
 
 
 # ---------------------------------------------------------------------------

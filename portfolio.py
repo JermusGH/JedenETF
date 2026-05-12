@@ -24,6 +24,9 @@ PORTFOLIO: dict[str, float] = {
 # Target currency for portfolio valuation
 TARGET_CURRENCY = "PLN"
 
+# Supported currencies for target currency selection (web UI and validation)
+SUPPORTED_CURRENCIES: list[str] = ["PLN", "EUR", "USD", "GBP", "CHF"]
+
 
 # ---------------------------------------------------------------------------
 # Price fetching
@@ -62,15 +65,24 @@ def fetch_prices(tickers: list[str], target_currency: str = TARGET_CURRENCY) -> 
             curr = info.get("currency", target_currency).upper()
             currencies[ticker] = curr
 
-            if curr != target_currency and curr not in fx_rates:
+            if curr == target_currency:
+                # Same currency — no FX conversion needed
+                fx_rates[curr] = 1.0
+            elif curr not in fx_rates:
                 fx_ticker = f"{curr}{target_currency}=X"
-                fx_data = yf.download(fx_ticker, period="5d", auto_adjust=True, progress=False)["Close"]
-                fx_data = fx_data.dropna()
-                if not fx_data.empty:
-                    fx_rates[curr] = float(fx_data.squeeze().iloc[-1])
-                    print(f"  FX {curr}/{target_currency}: {fx_rates[curr]:.4f}")
-                else:
-                    print(f"  [!] Could not fetch {curr}/{target_currency} rate, using 1.0")
+                try:
+                    fx_data = yf.download(
+                        fx_ticker, period="5d", auto_adjust=True, progress=False, timeout=5
+                    )["Close"]
+                    fx_data = fx_data.dropna()
+                    if not fx_data.empty:
+                        fx_rates[curr] = float(fx_data.squeeze().iloc[-1])
+                        print(f"  FX {curr}/{target_currency}: {fx_rates[curr]:.4f}")
+                    else:
+                        print(f"  [!] Could not fetch {curr}/{target_currency} rate, using 1.0")
+                        fx_rates[curr] = 1.0
+                except Exception as fx_exc:
+                    print(f"  [!] FX fetch timeout/error for {curr}{target_currency}=X: {fx_exc}, using 1.0")
                     fx_rates[curr] = 1.0
         except Exception as exc:
             print(f"  [!] Error for {ticker}: {exc}")

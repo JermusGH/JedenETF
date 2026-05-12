@@ -5,7 +5,6 @@ Merges holdings from multiple ETFs into a single unified view,
 showing your true exposure to individual companies across all funds.
 """
 
-import re
 import sys
 
 import pandas as pd
@@ -18,28 +17,9 @@ except ImportError:
     print(f"    Install with: {sys.executable} -m pip install yfinance")
     sys.exit(1)
 
+from analysis import enrich_holdings, merge_holdings
 from etf_holdings import fetch_holdings
 from portfolio import PORTFOLIO, TARGET_CURRENCY, fetch_prices, get_fund_family
-
-
-# ---------------------------------------------------------------------------
-# Company name normalisation (for merging across ETFs)
-# ---------------------------------------------------------------------------
-
-_STRIP_SUFFIXES = re.compile(
-    r"\b(?:INC|CORP|CORPORATION|LTD|LIMITED|PLC|COMPANY|AG|SA|NV|"
-    r"GROUP|HOLDINGS|HOLDING|SE|CLASS\s+[A-C]|CL\s+[A-C]|CO(?!\w))\b"
-)
-
-
-def _normalise_name(name) -> str:
-    """Reduce a company name to a short canonical form for deduplication."""
-    if pd.isna(name):
-        return ""
-    text = re.sub(r"[^\w\s]", "", str(name).upper())
-    text = _STRIP_SUFFIXES.sub("", text)
-    words = text.split()
-    return " ".join(words[:2])
 
 
 # ---------------------------------------------------------------------------
@@ -49,11 +29,11 @@ def _normalise_name(name) -> str:
 def _build_unified_portfolio(
     portfolio: dict[str, float],
     prices: dict[str, float | None],
-) -> tuple[pd.DataFrame, float]:
+) -> tuple[pd.DataFrame, float, list[pd.DataFrame]]:
     """
-    Fetch holdings for each ETF and merge into a single DataFrame.
+    Fetch holdings for each ETF and enrich with values.
 
-    Returns (combined_df, total_portfolio_value).
+    Returns (merged_df, total_portfolio_value, enriched_frames).
     """
     frames: list[pd.DataFrame] = []
     total_value = 0.0
@@ -80,46 +60,15 @@ def _build_unified_portfolio(
             print("  [!] Failed to fetch holdings")
             continue
 
-        # Convert weight (%) to portfolio value
-        weight_sum = df["weight"].sum()
-        if weight_sum > 10:
-            df["value"] = (df["weight"] / 100.0) * etf_value
-        else:
-            df["value"] = df["weight"] * etf_value
-
-        df["source"] = ticker
-        df["merge_key"] = df["name"].apply(_normalise_name)
-
+        enriched = enrich_holdings(df, etf_value, ticker)
         total_value += etf_value
-        frames.append(df)
+        frames.append(enriched)
 
     if not frames:
-        return pd.DataFrame(), 0.0
+        return pd.DataFrame(), 0.0, []
 
-    combined = pd.concat(frames, ignore_index=True)
-    return combined, total_value
-
-
-def _aggregate(combined: pd.DataFrame, total_value: float) -> pd.DataFrame:
-    """Group by normalised name and compute unified weights."""
-    # Prefer shorter ticker strings (real tickers over ISINs)
-    combined["_ticker_len"] = combined["ticker"].astype(str).str.len()
-    combined = combined.sort_values("_ticker_len")
-
-    grouped = (
-        combined.groupby("merge_key")
-        .agg(ticker=("ticker", "first"), name=("name", "first"), value=("value", "sum"))
-        .reset_index()
-    )
-    grouped["weight_%"] = (grouped["value"] / total_value) * 100.0
-
-    # Per-source contribution pivot
-    combined["contrib_%"] = (combined["value"] / total_value) * 100.0
-    pivot = combined.pivot_table(
-        index="merge_key", columns="source", values="contrib_%", aggfunc="sum", fill_value=0.0
-    ).reset_index()
-
-    return grouped.merge(pivot, on="merge_key")
+    final = merge_holdings(frames, total_value)
+    return final, total_value, frames
 
 
 # ---------------------------------------------------------------------------
@@ -198,13 +147,13 @@ def main():
 
     print("\n--- UNIFIED ETF PORTFOLIO ANALYSIS ---")
 
-    combined, total_value = _build_unified_portfolio(PORTFOLIO, prices)
-    if combined.empty:
+    final, total_value, frames = _build_unified_portfolio(PORTFOLIO, prices)
+    if final.empty:
         print("\n[!] No holdings data available for analysis.")
         return
 
-    sources = sorted(combined["source"].unique())
-    final = _aggregate(combined, total_value)
+    # Determine sources from the enriched frames
+    sources = sorted(set(s for f in frames for s in f["source"].unique()))
 
     lines = _print_report(final, total_value, sources)
 
