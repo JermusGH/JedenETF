@@ -8,6 +8,7 @@ from a Yahoo Finance ticker. All discovered data is cached locally.
 """
 
 import json
+import logging
 import os
 import re
 from io import StringIO
@@ -15,6 +16,7 @@ from io import StringIO
 import pandas as pd
 import requests
 
+from models import FetchResult
 from validation import is_valid_isin
 
 try:
@@ -22,6 +24,7 @@ try:
 except ImportError:
     curl_requests = None
 
+logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -29,18 +32,14 @@ except ImportError:
 
 _CACHE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".etf_cache.json")
 
-# Tracks tickers that were resolved via justETF (top 10 only) during the last
-# batch of fetch_holdings calls. Cleared at the start of each fetch_holdings call.
-_justetf_used: set[str] = set()
-_last_fetch_used_justetf: bool = False
+# Shared browser User-Agent used across all HTTP requests.
+_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/120.0.0.0 Safari/537.36"
+)
 
-_HTTP_HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/120.0.0.0 Safari/537.36"
-    ),
-}
+_HTTP_HEADERS = {"User-Agent": _USER_AGENT}
 
 _YF_EXCHANGE_TO_FT = {
     "L": ("LSE", "USD"),
@@ -51,12 +50,15 @@ _YF_EXCHANGE_TO_FT = {
     "SW": ("SWX", "CHF"),
 }
 
+# iShares page-level AJAX identifier (stable across sessions; used in the
+# CSV download URL pattern on ishares.com/uk).
+# Last verified: 2024-06-20
 _ISHARES_AJAX_ID = "1506575576011"
 _ISHARES_BASE_URL = "https://www.ishares.com/uk/individual/en/products"
 
 _VANGUARD_GRAPHQL_URL = "https://www.nl.vanguard/gpx/graphql"
 _VANGUARD_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+    "User-Agent": _USER_AGENT,
     "Content-Type": "application/json",
     "Accept": "application/json",
     "Origin": "https://www.nl.vanguard",
@@ -64,27 +66,18 @@ _VANGUARD_HEADERS = {
     "x-consumer-id": "nl-ui",
 }
 
-_INVESCO_BASE_URL = "https://www.invesco.com/uk/en/financial-products/etfs"
 _INVESCO_HOLDINGS_API = (
     "https://dng-api.invesco.com/cache/v1/accounts/en_GB/shareclasses"
 )
 _INVESCO_HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/120.0.0.0 Safari/537.36"
-    ),
+    "User-Agent": _USER_AGENT,
     "Accept": "application/json, text/plain, */*",
     "Referer": "https://www.invesco.com/uk/en/financial-products/etfs.html",
 }
 
 _XTRACKERS_BASE_URL = "https://etf.dws.com/en-gb"
 _XTRACKERS_HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/120.0.0.0 Safari/537.36"
-    ),
+    "User-Agent": _USER_AGENT,
     "Accept": "application/json, text/html, */*",
     "Referer": "https://etf.dws.com/en-gb/",
 }
@@ -98,7 +91,7 @@ def _load_cache() -> dict:
     """Load the discovery cache from disk.
 
     Returns an empty dict if the file does not exist, contains malformed JSON,
-    is empty, or cannot be read for any reason (Requirement 12.6).
+    is empty, or cannot be read for any reason.
     """
     if not os.path.exists(_CACHE_PATH):
         return {}
@@ -108,7 +101,8 @@ def _load_cache() -> dict:
         if isinstance(data, dict):
             return data
         return {}
-    except Exception:
+    except Exception as exc:
+        logger.debug("Cache load failed: %s", exc)
         return {}
 
 
@@ -116,13 +110,86 @@ def _save_cache(cache: dict) -> None:
     """Persist the discovery cache to disk.
 
     Silently continues on any write failure so that analysis is never
-    interrupted by a caching error (Requirement 12.7).
+    interrupted by a caching error.
     """
     try:
         with open(_CACHE_PATH, "w", encoding="utf-8") as fh:
             json.dump(cache, fh, indent=2)
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.debug("Cache save failed: %s", exc)
+
+
+# ---------------------------------------------------------------------------
+# Shared HTML table parser
+# ---------------------------------------------------------------------------
+
+def _parse_holdings_from_html(html: str, provider_label: str = "") -> pd.DataFrame | None:
+    """Extract holdings (name + weight) from an HTML page containing tables.
+
+    Searches for tables with at least 5 rows where one column contains
+    percentage-like values and another contains company names.
+
+    Parameters
+    ----------
+    html : str
+        Raw HTML content of the page.
+    provider_label : str
+        Label for log messages (e.g. "Invesco", "Xtrackers").
+
+    Returns
+    -------
+    pd.DataFrame or None
+        DataFrame with columns: ticker, name, weight. None if parsing fails.
+    """
+    rows: list[dict] = []
+
+    try:
+        tables = pd.read_html(StringIO(html))
+        for table in tables:
+            if table.shape[0] < 5:
+                continue
+            for col_idx in range(table.shape[1]):
+                col = table.iloc[:, col_idx].astype(str)
+                pct_matches = col.str.match(r"^\d+\.?\d*\s*%?$")
+                if pct_matches.sum() >= 5:
+                    # Found a weight column — find the name column
+                    name_col_idx = None
+                    for nc in range(table.shape[1]):
+                        if nc == col_idx:
+                            continue
+                        nc_vals = table.iloc[:, nc].astype(str)
+                        if nc_vals.str.contains(r"[A-Za-z]{3,}").sum() >= 5:
+                            name_col_idx = nc
+                            break
+                    if name_col_idx is not None:
+                        weights = pd.to_numeric(
+                            col.str.replace("%", "").str.replace(",", "."),
+                            errors="coerce",
+                        ).fillna(0.0)
+                        names = table.iloc[:, name_col_idx].astype(str)
+                        for name, weight in zip(names, weights):
+                            if name.strip() and weight > 0:
+                                rows.append({
+                                    "ticker": "N/A",
+                                    "name": name.strip(),
+                                    "weight": weight,
+                                })
+                        break
+            if rows:
+                break
+    except Exception as exc:
+        logger.debug("HTML table parsing failed for %s: %s", provider_label, exc)
+
+    if not rows:
+        return None
+
+    df = pd.DataFrame(rows)
+    df = df[df["weight"] > 0]
+    if df.empty:
+        return None
+
+    logger.info("Parsed %d holdings from %s page", len(df), provider_label or "HTML")
+    return df.reset_index(drop=True)
 
 
 # ---------------------------------------------------------------------------
@@ -166,11 +233,14 @@ def _discover_isin(yf_ticker: str) -> str | None:
 
 
 # ---------------------------------------------------------------------------
-# Provider detection
+# Provider detection (public — reused by app.py)
 # ---------------------------------------------------------------------------
 
-def _detect_provider(fund_family: str) -> str:
-    """Map fund family string to a provider key."""
+def detect_provider(fund_family: str) -> str:
+    """Map fund family string to a provider key.
+
+    Returns one of: 'ishares', 'vanguard', 'invesco', 'xtrackers', 'amundi', 'unknown'.
+    """
     family = fund_family.lower()
     if "blackrock" in family or "ishares" in family:
         return "ishares"
@@ -183,6 +253,10 @@ def _detect_provider(fund_family: str) -> str:
     if "amundi" in family:
         return "amundi"
     return "unknown"
+
+
+# Keep underscore alias for internal use and backwards compatibility with tests
+_detect_provider = detect_provider
 
 
 # ---------------------------------------------------------------------------
@@ -202,7 +276,7 @@ def _discover_ishares_product_id(isin: str) -> str | None:
         return None
 
 
-def _fetch_ishares(product_id: str) -> pd.DataFrame | None:
+def _fetch_ishares(product_id: str) -> FetchResult:
     """Download the full holdings CSV from iShares and return a normalised DataFrame."""
     url = (
         f"{_ISHARES_BASE_URL}/{product_id}/x/"
@@ -212,8 +286,8 @@ def _fetch_ishares(product_id: str) -> pd.DataFrame | None:
         resp = requests.get(url, headers=_HTTP_HEADERS, timeout=30)
         resp.raise_for_status()
     except Exception as exc:
-        print(f"  [!] iShares request failed: {exc}")
-        return None
+        logger.warning("iShares request failed: %s", exc)
+        return FetchResult(holdings=None, used_justetf=False)
 
     lines = resp.text.splitlines()
     header_idx = next(
@@ -221,16 +295,16 @@ def _fetch_ishares(product_id: str) -> pd.DataFrame | None:
         None,
     )
     if header_idx is None:
-        print("  [!] Could not locate CSV header in iShares response")
-        return None
+        logger.warning("Could not locate CSV header in iShares response")
+        return FetchResult(holdings=None, used_justetf=False)
 
     df = pd.read_csv(StringIO("\n".join(lines[header_idx:])), on_bad_lines="skip")
     if "Name" not in df.columns or "Weight (%)" not in df.columns:
-        return None
+        return FetchResult(holdings=None, used_justetf=False)
 
     df = df[df["Name"].notna() & (df["Name"].astype(str).str.strip() != "")]
 
-    return pd.DataFrame({
+    holdings = pd.DataFrame({
         "ticker": df["Ticker"].astype(str).values if "Ticker" in df.columns else "N/A",
         "name": df["Name"].values,
         "weight": pd.to_numeric(
@@ -239,12 +313,14 @@ def _fetch_ishares(product_id: str) -> pd.DataFrame | None:
         ).fillna(0.0).values,
     }).reset_index(drop=True)
 
+    return FetchResult(holdings=holdings, used_justetf=False)
+
 
 # ---------------------------------------------------------------------------
 # Vanguard provider
 # ---------------------------------------------------------------------------
 
-def _fetch_vanguard(isin: str) -> pd.DataFrame | None:
+def _fetch_vanguard(isin: str) -> FetchResult:
     """Query the Vanguard GraphQL API by ISIN and return a normalised DataFrame."""
     query = (
         '{ borHoldings(isins: ["%s"]) '
@@ -261,208 +337,95 @@ def _fetch_vanguard(isin: str) -> pd.DataFrame | None:
         resp.raise_for_status()
         data = resp.json()
     except Exception as exc:
-        print(f"  [!] Vanguard request failed: {exc}")
-        return None
+        logger.warning("Vanguard request failed: %s", exc)
+        return FetchResult(holdings=None, used_justetf=False)
 
     if "errors" in data:
-        print(f"  [!] Vanguard API error: {data['errors'][0].get('message', '')}")
-        return None
+        logger.warning("Vanguard API error: %s", data["errors"][0].get("message", ""))
+        return FetchResult(holdings=None, used_justetf=False)
 
     try:
         items = data["data"]["borHoldings"][0]["holdings"]["items"]
     except (KeyError, IndexError, TypeError):
-        print("  [!] Unexpected Vanguard response structure")
-        return None
+        logger.warning("Unexpected Vanguard response structure")
+        return FetchResult(holdings=None, used_justetf=False)
 
     if not items:
-        return None
+        return FetchResult(holdings=None, used_justetf=False)
 
     df = pd.DataFrame({
         "ticker": [it.get("ticker") or "N/A" for it in items],
         "name": [it.get("issuerName", "") for it in items],
         "weight": [it.get("marketValuePercentage", 0.0) for it in items],
     })
-    return df[df["name"].str.strip() != ""].reset_index(drop=True)
+    holdings = df[df["name"].str.strip() != ""].reset_index(drop=True)
+    if holdings.empty:
+        return FetchResult(holdings=None, used_justetf=False)
+    return FetchResult(holdings=holdings, used_justetf=False)
 
 
 # ---------------------------------------------------------------------------
 # Invesco provider
 # ---------------------------------------------------------------------------
 
-def _discover_invesco_slug(isin: str) -> str | None:
-    """Discover the Invesco product page slug from justETF's link to invesco.com."""
-    # Kept for potential future use but not currently needed — the DNG API works directly.
-    url = f"https://www.justetf.com/en/etf-profile.html?isin={isin}"
-    try:
-        resp = requests.get(url, headers=_HTTP_HEADERS, timeout=15)
-        if not resp.ok:
-            return None
-        match = re.search(
-            r"invesco\.com/[^\"]*?/financial-products/etfs/([a-z0-9\-]+?)(?:\.html)?[\"?]",
-            resp.text,
-        )
-        return match.group(1) if match else None
-    except Exception:
-        return None
-
-
-def _fetch_invesco(isin: str) -> pd.DataFrame | None:
+def _fetch_invesco(isin: str) -> FetchResult:
     """Fetch holdings from the Invesco DNG API for a given ISIN.
 
     Uses the public Invesco API endpoint that powers their product pages.
     Returns all holdings (not just top 10).
     """
-    api_url = (
-        f"{_INVESCO_HOLDINGS_API}/{isin}/holdings/index?idType=isin"
-    )
+    api_url = f"{_INVESCO_HOLDINGS_API}/{isin}/holdings/index?idType=isin"
     try:
         resp = requests.get(api_url, headers=_INVESCO_HEADERS, timeout=20)
         if not resp.ok:
-            print(f"  [!] Invesco API returned {resp.status_code}")
+            logger.warning("Invesco API returned %d", resp.status_code)
             return _fetch_justetf(isin)
 
         data = resp.json()
         items = data.get("holdings")
         if not items:
-            print("  [!] Invesco API returned no holdings")
+            logger.warning("Invesco API returned no holdings")
             return _fetch_justetf(isin)
 
         rows = []
         for item in items:
             name = item.get("name", "")
             weight = item.get("weight", 0.0)
-            # Strip currency denomination from name (e.g. "NVIDIA CORP USD0.001" → "NVIDIA CORP")
+            # Strip currency denomination (e.g. "NVIDIA CORP USD0.001" → "NVIDIA CORP")
             name = re.sub(r'\s+[A-Z]{3}\d[\d.]*$', '', name)
             if name and weight > 0:
                 rows.append({"ticker": "N/A", "name": name, "weight": float(weight)})
 
         if not rows:
-            print("  [!] No valid holdings parsed from Invesco API")
+            logger.warning("No valid holdings parsed from Invesco API")
             return _fetch_justetf(isin)
 
         df = pd.DataFrame(rows)
-        print(f"  Invesco API returned {len(df)} holdings")
-        return df.reset_index(drop=True)
+        logger.info("Invesco API returned %d holdings", len(df))
+        return FetchResult(holdings=df.reset_index(drop=True), used_justetf=False)
 
     except Exception as exc:
-        print(f"  [!] Invesco API request failed: {exc}")
+        logger.warning("Invesco API request failed: %s", exc)
         return _fetch_justetf(isin)
-
-
-def _parse_invesco_holdings_page(html: str) -> pd.DataFrame | None:
-    """Parse holdings data from an Invesco product page HTML.
-
-    The page contains a holdings table with columns for name, CUSIP, ISIN, and weight.
-    """
-    # Try to find holdings data in the HTML
-    # Pattern 1: Table rows with weight percentages (e.g. "8.78%")
-    # The Invesco page shows holdings like: NAME | CUSIP | ISIN | WEIGHT%
-    rows = []
-
-    # Look for structured holdings data — the page renders holdings in a table
-    # with security name and weight percentage
-    holdings_pattern = re.findall(
-        r'([A-Z][A-Z0-9 &.,/\-\'()]+?)\s+[A-Z]{3}\d[\d.]*\s*\|\s*[A-Z0-9]+\s*\|\s*[A-Z]{2}[A-Z0-9]{10}\s*\|\s*(\d+\.?\d*)\s*%',
-        html,
-    )
-    if not holdings_pattern:
-        # Try without the currency denomination part
-        holdings_pattern = re.findall(
-            r'([A-Z][A-Z0-9 &.,/\-\'()]+?)\s*\|\s*[A-Z0-9]+\s*\|\s*[A-Z]{2}[A-Z0-9]{10}\s*\|\s*(\d+\.?\d*)\s*%',
-            html,
-        )
-    if holdings_pattern:
-        for name, weight in holdings_pattern:
-            name = name.strip()
-            # Remove trailing currency denomination (e.g. "USD0.001")
-            name = re.sub(r'\s+[A-Z]{3}\d[\d.]*$', '', name)
-            if name and float(weight) > 0:
-                rows.append({"ticker": "N/A", "name": name, "weight": float(weight)})
-
-    # Pattern 2: Try parsing HTML tables with pd.read_html
-    if not rows:
-        try:
-            tables = pd.read_html(StringIO(html))
-            for table in tables:
-                # Look for a table that has a percentage column and enough rows
-                if table.shape[0] < 5:
-                    continue
-                # Check if any column contains percentage-like values
-                for col_idx in range(table.shape[1]):
-                    col = table.iloc[:, col_idx].astype(str)
-                    pct_matches = col.str.match(r"^\d+\.?\d*\s*%?$")
-                    if pct_matches.sum() >= 5:
-                        # Found a weight column — find the name column
-                        name_col_idx = None
-                        for nc in range(table.shape[1]):
-                            if nc == col_idx:
-                                continue
-                            nc_vals = table.iloc[:, nc].astype(str)
-                            # Name column should have mostly alphabetic content
-                            if nc_vals.str.contains(r"[A-Za-z]{3,}").sum() >= 5:
-                                name_col_idx = nc
-                                break
-                        if name_col_idx is not None:
-                            weights = pd.to_numeric(
-                                col.str.replace("%", "").str.replace(",", "."),
-                                errors="coerce",
-                            ).fillna(0.0)
-                            names = table.iloc[:, name_col_idx].astype(str)
-                            for name, weight in zip(names, weights):
-                                if name.strip() and weight > 0:
-                                    rows.append({
-                                        "ticker": "N/A",
-                                        "name": name.strip(),
-                                        "weight": weight,
-                                    })
-                            break
-                if rows:
-                    break
-        except Exception:
-            pass
-
-    if not rows:
-        return None
-
-    df = pd.DataFrame(rows)
-    df = df[df["weight"] > 0]
-    if df.empty:
-        return None
-
-    print(f"  Parsed {len(df)} holdings from Invesco page")
-    return df.reset_index(drop=True)
 
 
 # ---------------------------------------------------------------------------
 # Xtrackers (DWS) provider
 # ---------------------------------------------------------------------------
 
-def _fetch_xtrackers(isin: str) -> pd.DataFrame | None:
+def _fetch_xtrackers(isin: str) -> FetchResult:
     """Fetch holdings for an Xtrackers (DWS) ETF.
 
     Strategy:
-    1. Try scraping the DWS product page via curl_cffi (bypasses consent wall).
+    1. Try to find the correct product page slug from justETF, then scrape it.
     2. Try the Vanguard GraphQL API (sometimes has cross-provider data).
-    3. Fall back to justETF.
+    3. Fall back to justETF top-10.
     """
-    # --- Attempt 1: DWS product page ---
-    product_url = f"{_XTRACKERS_BASE_URL}/{isin}-msci-world-ucits-etf-1c/"
-    try:
-        if curl_requests:
-            resp = curl_requests.get(product_url, impersonate="chrome", timeout=20)
-            if resp.ok and "holdings" in resp.text.lower():
-                df = _parse_xtrackers_holdings_page(resp.text)
-                if df is not None:
-                    return df
-    except Exception:
-        pass
-
-    # --- Attempt 2: Try to find the correct product page slug from justETF ---
+    # --- Attempt 1: Find the correct DWS product page via justETF link ---
     try:
         justetf_url = f"https://www.justetf.com/en/etf-profile.html?isin={isin}"
         resp = requests.get(justetf_url, headers=_HTTP_HEADERS, timeout=15)
         if resp.ok:
-            # Look for etf.dws.com product page links
             match = re.search(
                 r'href="(https?://etf\.dws\.com/[^"]+?/' + re.escape(isin) + r'[^"]*)"',
                 resp.text,
@@ -470,108 +433,46 @@ def _fetch_xtrackers(isin: str) -> pd.DataFrame | None:
             if match:
                 dws_url = match.group(1)
                 if curl_requests:
-                    page_resp = curl_requests.get(
-                        dws_url, impersonate="chrome", timeout=20
-                    )
+                    page_resp = curl_requests.get(dws_url, impersonate="chrome", timeout=20)
                 else:
-                    page_resp = requests.get(
-                        dws_url, headers=_XTRACKERS_HEADERS, timeout=20
-                    )
+                    page_resp = requests.get(dws_url, headers=_XTRACKERS_HEADERS, timeout=20)
                 if page_resp.ok:
-                    df = _parse_xtrackers_holdings_page(page_resp.text)
+                    df = _parse_holdings_from_html(page_resp.text, "Xtrackers")
                     if df is not None:
-                        return df
+                        return FetchResult(holdings=df, used_justetf=False)
     except Exception:
         pass
 
-    # --- Attempt 3: Vanguard GraphQL (sometimes has cross-provider data) ---
+    # --- Attempt 2: Vanguard GraphQL (sometimes has cross-provider data) ---
     result = _fetch_vanguard(isin)
-    if result is not None:
+    if result.holdings is not None:
         return result
 
-    # --- Attempt 4: justETF fallback ---
-    print("  [!] Xtrackers direct fetch failed, falling back to justETF")
-    result = _fetch_justetf(isin)
-    if result is None:
-        print(
-            "  [!] No holdings data available. This may be a swap-based or money market ETF "
+    # --- Attempt 3: justETF fallback ---
+    logger.info("Xtrackers direct fetch failed, falling back to justETF")
+    justetf_result = _fetch_justetf(isin)
+    if justetf_result.holdings is None:
+        logger.warning(
+            "No holdings data available. This may be a swap-based or money market ETF "
             "that does not hold individual securities."
         )
-    return result
-
-
-def _parse_xtrackers_holdings_page(html: str) -> pd.DataFrame | None:
-    """Parse holdings data from a DWS/Xtrackers product page HTML."""
-    rows = []
-
-    # DWS pages may contain holdings in HTML tables
-    try:
-        tables = pd.read_html(StringIO(html))
-        for table in tables:
-            if table.shape[0] < 5:
-                continue
-            # Look for a column with percentage values and a name column
-            for col_idx in range(table.shape[1]):
-                col = table.iloc[:, col_idx].astype(str)
-                pct_matches = col.str.match(r"^\d+\.?\d*\s*%?$")
-                if pct_matches.sum() >= 5:
-                    # Found a weight column — find the name column
-                    name_col_idx = None
-                    for nc in range(table.shape[1]):
-                        if nc == col_idx:
-                            continue
-                        nc_vals = table.iloc[:, nc].astype(str)
-                        if nc_vals.str.contains(r"[A-Za-z]{3,}").sum() >= 5:
-                            name_col_idx = nc
-                            break
-                    if name_col_idx is not None:
-                        weights = pd.to_numeric(
-                            col.str.replace("%", "").str.replace(",", "."),
-                            errors="coerce",
-                        ).fillna(0.0)
-                        names = table.iloc[:, name_col_idx].astype(str)
-                        for name, weight in zip(names, weights):
-                            if name.strip() and weight > 0:
-                                rows.append({
-                                    "ticker": "N/A",
-                                    "name": name.strip(),
-                                    "weight": weight,
-                                })
-                        break
-            if rows:
-                break
-    except Exception:
-        pass
-
-    if not rows:
-        return None
-
-    df = pd.DataFrame(rows)
-    df = df[df["weight"] > 0]
-    if df.empty:
-        return None
-
-    print(f"  Parsed {len(df)} holdings from Xtrackers page")
-    return df.reset_index(drop=True)
+    return justetf_result
 
 
 # ---------------------------------------------------------------------------
 # justETF fallback (Amundi and other providers without a public API)
 # ---------------------------------------------------------------------------
 
-def _fetch_justetf(isin: str) -> pd.DataFrame | None:
+def _fetch_justetf(isin: str) -> FetchResult:
     """Scrape the top-10 holdings table from the justETF profile page."""
-    global _last_fetch_used_justetf
-    _last_fetch_used_justetf = False
-
     url = f"https://www.justetf.com/en/etf-profile.html?isin={isin}"
     try:
         resp = requests.get(url, headers=_HTTP_HEADERS, timeout=15)
         if not resp.ok:
-            return None
+            return FetchResult(holdings=None, used_justetf=False)
         tables = pd.read_html(StringIO(resp.text))
     except Exception:
-        return None
+        return FetchResult(holdings=None, used_justetf=False)
 
     for table in tables:
         if table.shape[0] < 5 or table.shape[1] != 2:
@@ -594,117 +495,174 @@ def _fetch_justetf(isin: str) -> pd.DataFrame | None:
         })
         df = df[df["weight"] > 0]
         if not df.empty:
-            _last_fetch_used_justetf = True
-            return df.reset_index(drop=True)
+            return FetchResult(holdings=df.reset_index(drop=True), used_justetf=True)
 
-    return None
+    return FetchResult(holdings=None, used_justetf=False)
 
 
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
 
+class HoldingsFetcher:
+    """Stateful holdings fetcher that tracks justETF usage per batch.
+
+    Usage::
+
+        fetcher = HoldingsFetcher()
+        df = fetcher.fetch(ticker, fund_family)
+        # After all fetches:
+        justetf_tickers = fetcher.justetf_tickers
+    """
+
+    def __init__(self) -> None:
+        self._justetf_used: set[str] = set()
+        self._cache: dict | None = None
+
+    @property
+    def justetf_tickers(self) -> set[str]:
+        """Tickers that were resolved via justETF (top 10 only) in this batch."""
+        return self._justetf_used.copy()
+
+    def clear(self) -> None:
+        """Reset tracking state for a new batch."""
+        self._justetf_used.clear()
+        self._cache = None
+
+    def _get_cache(self) -> dict:
+        """Load cache once per batch, reusing across multiple fetch() calls."""
+        if self._cache is None:
+            self._cache = _load_cache()
+        return self._cache
+
+    def _persist_cache(self) -> None:
+        """Write the in-memory cache to disk."""
+        if self._cache is not None:
+            _save_cache(self._cache)
+
+    def _resolve_isin(self, yf_ticker: str) -> str | None:
+        """Resolve ISIN from cache or discovery, updating cache on success."""
+        cache = self._get_cache()
+        isin = cache.get(yf_ticker, {}).get("isin")
+        if isin:
+            return isin
+
+        logger.info("Discovering ISIN for %s...", yf_ticker)
+        isin = _discover_isin(yf_ticker)
+        if isin:
+            cache.setdefault(yf_ticker, {})["isin"] = isin
+            self._persist_cache()
+            logger.info("Found ISIN: %s", isin)
+            return isin
+
+        logger.warning("Could not discover ISIN for %s", yf_ticker)
+        return None
+
+    def _handle_fetch_result(self, yf_ticker: str, result: FetchResult, provider: str, isin: str) -> pd.DataFrame | None:
+        """Process a FetchResult: update cache and tracking, return holdings."""
+        if result.holdings is not None:
+            cache = self._get_cache()
+            cache.setdefault(yf_ticker, {}).update({"provider": provider, "isin": isin})
+            self._persist_cache()
+            if result.used_justetf:
+                self._justetf_used.add(yf_ticker)
+        return result.holdings
+
+    def fetch(self, yf_ticker: str, fund_family: str = "") -> pd.DataFrame | None:
+        """
+        Fetch live holdings for an ETF given its Yahoo Finance ticker.
+
+        Auto-discovers the ISIN, detects the provider, and fetches holdings.
+        All discovery results are cached in ``.etf_cache.json`` for speed.
+
+        Parameters
+        ----------
+        yf_ticker : str
+            Yahoo Finance ticker, e.g. ``'CSPX.L'``, ``'VHVE.L'``, ``'PRAM.DE'``.
+        fund_family : str, optional
+            Fund family string (from ``yfinance``). Helps route to the correct provider.
+
+        Returns
+        -------
+        pd.DataFrame or None
+            Columns: ``ticker``, ``name``, ``weight`` (percentage).
+            Returns ``None`` if the fetch fails entirely.
+        """
+        cache = self._get_cache()
+
+        # --- Resolve ISIN ---
+        isin = self._resolve_isin(yf_ticker)
+        if not isin:
+            return None
+
+        # --- Detect provider ---
+        provider = cache.get(yf_ticker, {}).get("provider") or detect_provider(fund_family)
+
+        # --- Fetch by provider ---
+        if provider == "vanguard":
+            result = _fetch_vanguard(isin)
+            return self._handle_fetch_result(yf_ticker, result, "vanguard", isin)
+
+        if provider == "invesco":
+            result = _fetch_invesco(isin)
+            return self._handle_fetch_result(yf_ticker, result, "invesco", isin)
+
+        if provider == "xtrackers":
+            result = _fetch_xtrackers(isin)
+            return self._handle_fetch_result(yf_ticker, result, "xtrackers", isin)
+
+        if provider == "amundi":
+            logger.info("Using justETF fallback (top holdings only)")
+            result = _fetch_justetf(isin)
+            if result.holdings is not None:
+                self._justetf_used.add(yf_ticker)
+            return result.holdings
+
+        # iShares or unknown — try product ID discovery
+        product_id = cache.get(yf_ticker, {}).get("product_id")
+        if not product_id:
+            logger.info("Discovering iShares product ID for %s...", isin)
+            product_id = _discover_ishares_product_id(isin)
+            if product_id:
+                entry = cache.setdefault(yf_ticker, {})
+                entry.update({"product_id": product_id, "provider": "ishares", "isin": isin})
+                self._persist_cache()
+                logger.info("Found product ID: %s", product_id)
+            else:
+                # Fallback chain: Vanguard → justETF
+                vanguard_result = _fetch_vanguard(isin)
+                if vanguard_result.holdings is not None:
+                    return self._handle_fetch_result(yf_ticker, vanguard_result, "vanguard", isin)
+                logger.info("Trying justETF fallback...")
+                result = _fetch_justetf(isin)
+                if result.holdings is not None:
+                    self._justetf_used.add(yf_ticker)
+                return result.holdings
+
+        result = _fetch_ishares(product_id)
+        return result.holdings
+
+
+# ---------------------------------------------------------------------------
+# Module-level convenience API (backwards-compatible)
+# ---------------------------------------------------------------------------
+
+_default_fetcher = HoldingsFetcher()
+
+
 def get_justetf_tickers() -> set[str]:
     """Return the set of tickers that were resolved via justETF (top 10 only)."""
-    return _justetf_used.copy()
+    return _default_fetcher.justetf_tickers
 
 
 def clear_justetf_tickers() -> None:
     """Clear the justETF tracking set. Call before a new analysis batch."""
-    _justetf_used.clear()
+    _default_fetcher.clear()
 
 
 def fetch_holdings(yf_ticker: str, fund_family: str = "") -> pd.DataFrame | None:
-    """
-    Fetch live holdings for an ETF given its Yahoo Finance ticker.
-
-    Auto-discovers the ISIN, detects the provider, and fetches holdings.
-    All discovery results are cached in ``.etf_cache.json`` for speed.
-
-    Parameters
-    ----------
-    yf_ticker : str
-        Yahoo Finance ticker, e.g. ``'CSPX.L'``, ``'VHVE.L'``, ``'PRAM.DE'``.
-    fund_family : str, optional
-        Fund family string (from ``yfinance``). Helps route to the correct provider.
-
-    Returns
-    -------
-    pd.DataFrame or None
-        Columns: ``ticker``, ``name``, ``weight`` (percentage, e.g. 8.24 means 8.24%).
-        Returns ``None`` if the fetch fails entirely.
-    """
-    cache = _load_cache()
-
-    # --- Resolve ISIN ---
-    isin = cache.get(yf_ticker, {}).get("isin")
-    if not isin:
-        print(f"  Discovering ISIN for {yf_ticker}...")
-        isin = _discover_isin(yf_ticker)
-        if isin:
-            cache.setdefault(yf_ticker, {})["isin"] = isin
-            _save_cache(cache)
-            print(f"  Found ISIN: {isin}")
-        else:
-            print(f"  [!] Could not discover ISIN for {yf_ticker}")
-            return None
-
-    # --- Detect provider ---
-    provider = cache.get(yf_ticker, {}).get("provider") or _detect_provider(fund_family)
-
-    # --- Fetch by provider ---
-    if provider == "vanguard":
-        return _fetch_vanguard(isin)
-
-    if provider == "invesco":
-        result = _fetch_invesco(isin)
-        if result is not None:
-            cache.setdefault(yf_ticker, {}).update({"provider": "invesco", "isin": isin})
-            _save_cache(cache)
-            if _last_fetch_used_justetf:
-                _justetf_used.add(yf_ticker)
-        return result
-
-    if provider == "xtrackers":
-        result = _fetch_xtrackers(isin)
-        if result is not None:
-            cache.setdefault(yf_ticker, {}).update({"provider": "xtrackers", "isin": isin})
-            _save_cache(cache)
-            if _last_fetch_used_justetf:
-                _justetf_used.add(yf_ticker)
-        return result
-
-    if provider == "amundi":
-        print("  Using justETF fallback (top holdings only)")
-        result = _fetch_justetf(isin)
-        if result is not None:
-            _justetf_used.add(yf_ticker)
-        return result
-
-    # iShares or unknown
-    product_id = cache.get(yf_ticker, {}).get("product_id")
-    if not product_id:
-        print(f"  Discovering iShares product ID for {isin}...")
-        product_id = _discover_ishares_product_id(isin)
-        if product_id:
-            entry = cache.setdefault(yf_ticker, {})
-            entry.update({"product_id": product_id, "provider": "ishares", "isin": isin})
-            _save_cache(cache)
-            print(f"  Found product ID: {product_id}")
-        else:
-            # Fallback chain: Vanguard → justETF
-            result = _fetch_vanguard(isin)
-            if result is not None:
-                cache.setdefault(yf_ticker, {}).update({"provider": "vanguard", "isin": isin})
-                _save_cache(cache)
-                return result
-            print("  Trying justETF fallback...")
-            result = _fetch_justetf(isin)
-            if result is not None:
-                _justetf_used.add(yf_ticker)
-            return result
-
-    return _fetch_ishares(product_id)
+    """Convenience wrapper using the module-level default fetcher."""
+    return _default_fetcher.fetch(yf_ticker, fund_family)
 
 
 # ---------------------------------------------------------------------------
@@ -712,6 +670,7 @@ def fetch_holdings(yf_ticker: str, fund_family: str = "") -> pd.DataFrame | None
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
     print("=== ETF Holdings Scraper ===\n")
     test_tickers = {
         "CSPX.L": "BlackRock",
@@ -720,9 +679,10 @@ if __name__ == "__main__":
         "XDWD.DE": "DWS Investment S.A. (ETF)",
         "PRAM.DE": "Amundi",
     }
+    fetcher = HoldingsFetcher()
     for ticker, family in test_tickers.items():
         print(f"[{ticker}] ({family})")
-        holdings = fetch_holdings(ticker, fund_family=family)
+        holdings = fetcher.fetch(ticker, fund_family=family)
         if holdings is not None:
             print(f"  {len(holdings)} holdings loaded")
             for _, row in holdings.nlargest(3, "weight").iterrows():

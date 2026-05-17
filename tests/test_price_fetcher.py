@@ -10,7 +10,7 @@ import pandas as pd
 import pytest
 from unittest.mock import patch, MagicMock
 
-from portfolio import fetch_prices
+from pricing import fetch_prices
 
 
 def _make_price_download(data: dict[str, list[float]], dates=None):
@@ -58,8 +58,8 @@ def _make_fx_download(rates: list[float], dates=None):
 class TestPriceFetchWithFXConversion:
     """Test successful price fetch with FX conversion (USD → PLN)."""
 
-    @patch("portfolio.yf.Ticker")
-    @patch("portfolio.yf.download")
+    @patch("pricing.yf.Ticker")
+    @patch("pricing.yf.download")
     def test_usd_ticker_converted_to_pln(self, mock_download, mock_ticker):
         """
         Validates: Requirements 8.1, 8.2, 8.4, 8.5
@@ -85,8 +85,8 @@ class TestPriceFetchWithFXConversion:
 class TestTickerAlreadyInPLN:
     """Test ticker already trading in PLN — no FX conversion needed."""
 
-    @patch("portfolio.yf.Ticker")
-    @patch("portfolio.yf.download")
+    @patch("pricing.yf.Ticker")
+    @patch("pricing.yf.download")
     def test_pln_ticker_no_conversion(self, mock_download, mock_ticker):
         """
         Validates: Requirements 8.2, 8.5
@@ -110,8 +110,8 @@ class TestTickerAlreadyInPLN:
 class TestCurrencyCannotBeDetermined:
     """Test currency can't be determined — assumes PLN (rate 1.0)."""
 
-    @patch("portfolio.yf.Ticker")
-    @patch("portfolio.yf.download")
+    @patch("pricing.yf.Ticker")
+    @patch("pricing.yf.download")
     def test_missing_currency_assumes_pln(self, mock_download, mock_ticker):
         """
         Validates: Requirements 8.3
@@ -136,8 +136,8 @@ class TestCurrencyCannotBeDetermined:
 class TestFXRateFetchFails:
     """Test FX rate fetch fails — uses rate 1.0."""
 
-    @patch("portfolio.yf.Ticker")
-    @patch("portfolio.yf.download")
+    @patch("pricing.yf.Ticker")
+    @patch("pricing.yf.download")
     def test_fx_rate_failure_uses_one(self, mock_download, mock_ticker):
         """
         Validates: Requirements 8.6
@@ -165,8 +165,8 @@ class TestFXRateFetchFails:
 class TestTickerPriceCannotBeRetrieved:
     """Test ticker price can't be retrieved — returns None."""
 
-    @patch("portfolio.yf.Ticker")
-    @patch("portfolio.yf.download")
+    @patch("pricing.yf.Ticker")
+    @patch("pricing.yf.download")
     def test_missing_price_returns_none(self, mock_download, mock_ticker):
         """
         Validates: Requirements 8.7
@@ -209,8 +209,8 @@ class TestTickerPriceCannotBeRetrieved:
 class TestMultipleTickersDifferentCurrencies:
     """Test multiple tickers with different currencies — each converted correctly."""
 
-    @patch("portfolio.yf.Ticker")
-    @patch("portfolio.yf.download")
+    @patch("pricing.yf.Ticker")
+    @patch("pricing.yf.download")
     def test_multiple_tickers_correct_conversion(self, mock_download, mock_ticker):
         """
         Validates: Requirements 8.1, 8.2, 8.4, 8.5

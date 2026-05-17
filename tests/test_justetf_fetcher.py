@@ -18,6 +18,7 @@ import pytest
 import requests
 
 from etf_holdings import _fetch_justetf
+from models import FetchResult
 
 
 # ---------------------------------------------------------------------------
@@ -135,7 +136,8 @@ class TestFetchJustETFSuccessfulScraping:
         """Verify correct parsing of a realistic holdings table."""
         mock_get.return_value = _mock_response(REALISTIC_HOLDINGS_HTML)
 
-        result = _fetch_justetf("IE00B5BMR087")
+        fetch_result = _fetch_justetf("IE00B5BMR087")
+        result = fetch_result.holdings
 
         assert result is not None
         assert len(result) == 10
@@ -146,7 +148,8 @@ class TestFetchJustETFSuccessfulScraping:
         """Verify ticker is always 'N/A' since justETF doesn't provide tickers (Req 6.4)."""
         mock_get.return_value = _mock_response(REALISTIC_HOLDINGS_HTML)
 
-        result = _fetch_justetf("IE00B5BMR087")
+        fetch_result = _fetch_justetf("IE00B5BMR087")
+        result = fetch_result.holdings
 
         assert result is not None
         assert (result["ticker"] == "N/A").all()
@@ -156,7 +159,8 @@ class TestFetchJustETFSuccessfulScraping:
         """Verify weight strings like '8.24%' are parsed to float 8.24."""
         mock_get.return_value = _mock_response(REALISTIC_HOLDINGS_HTML)
 
-        result = _fetch_justetf("IE00B5BMR087")
+        fetch_result = _fetch_justetf("IE00B5BMR087")
+        result = fetch_result.holdings
 
         assert result is not None
         assert result["weight"].iloc[0] == pytest.approx(8.24)
@@ -168,7 +172,8 @@ class TestFetchJustETFSuccessfulScraping:
         """Verify company names are preserved from the HTML table."""
         mock_get.return_value = _mock_response(REALISTIC_HOLDINGS_HTML)
 
-        result = _fetch_justetf("IE00B5BMR087")
+        fetch_result = _fetch_justetf("IE00B5BMR087")
+        result = fetch_result.holdings
 
         assert result is not None
         assert result["name"].iloc[0] == "Apple Inc"
@@ -183,7 +188,8 @@ class TestFetchJustETFPerformanceTableExclusion:
         """A table containing 'YTD' in the first column should be skipped."""
         mock_get.return_value = _mock_response(PERFORMANCE_TABLE_HTML)
 
-        result = _fetch_justetf("IE00B5BMR087")
+        fetch_result = _fetch_justetf("IE00B5BMR087")
+        result = fetch_result.holdings
 
         # Performance table is excluded, no other valid table exists
         assert result is None
@@ -201,7 +207,8 @@ class TestFetchJustETFPerformanceTableExclusion:
         ])
         mock_get.return_value = _mock_response(html)
 
-        result = _fetch_justetf("IE00B5BMR087")
+        fetch_result = _fetch_justetf("IE00B5BMR087")
+        result = fetch_result.holdings
 
         assert result is None
 
@@ -218,7 +225,8 @@ class TestFetchJustETFPerformanceTableExclusion:
         ])
         mock_get.return_value = _mock_response(html)
 
-        result = _fetch_justetf("IE00B5BMR087")
+        fetch_result = _fetch_justetf("IE00B5BMR087")
+        result = fetch_result.holdings
 
         assert result is None
 
@@ -235,7 +243,8 @@ class TestFetchJustETFPerformanceTableExclusion:
         ])
         mock_get.return_value = _mock_response(html)
 
-        result = _fetch_justetf("IE00B5BMR087")
+        fetch_result = _fetch_justetf("IE00B5BMR087")
+        result = fetch_result.holdings
 
         assert result is None
 
@@ -252,7 +261,8 @@ class TestFetchJustETFPerformanceTableExclusion:
         ])
         mock_get.return_value = _mock_response(html)
 
-        result = _fetch_justetf("IE00B5BMR087")
+        fetch_result = _fetch_justetf("IE00B5BMR087")
+        result = fetch_result.holdings
 
         assert result is None
 
@@ -265,7 +275,8 @@ class TestFetchJustETFNoMatchingTable:
         """A page with only a 3-column table should return None."""
         mock_get.return_value = _mock_response(NO_MATCHING_TABLE_HTML)
 
-        result = _fetch_justetf("IE00B5BMR087")
+        fetch_result = _fetch_justetf("IE00B5BMR087")
+        result = fetch_result.holdings
 
         assert result is None
 
@@ -279,7 +290,8 @@ class TestFetchJustETFNoMatchingTable:
         ])
         mock_get.return_value = _mock_response(html)
 
-        result = _fetch_justetf("IE00B5BMR087")
+        fetch_result = _fetch_justetf("IE00B5BMR087")
+        result = fetch_result.holdings
 
         assert result is None
 
@@ -297,7 +309,8 @@ class TestFetchJustETFNoMatchingTable:
         ])
         mock_get.return_value = _mock_response(html)
 
-        result = _fetch_justetf("IE00B5BMR087")
+        fetch_result = _fetch_justetf("IE00B5BMR087")
+        result = fetch_result.holdings
 
         assert result is None
 
@@ -306,7 +319,8 @@ class TestFetchJustETFNoMatchingTable:
         """An empty HTML page with no tables should return None."""
         mock_get.return_value = _mock_response("<html><body></body></html>")
 
-        result = _fetch_justetf("IE00B5BMR087")
+        fetch_result = _fetch_justetf("IE00B5BMR087")
+        result = fetch_result.holdings
 
         assert result is None
 
@@ -319,7 +333,8 @@ class TestFetchJustETFZeroWeightExclusion:
         """Holdings with weight 0.00% should be excluded from results."""
         mock_get.return_value = _mock_response(HOLDINGS_WITH_ZERO_WEIGHT_HTML)
 
-        result = _fetch_justetf("IE00B5BMR087")
+        fetch_result = _fetch_justetf("IE00B5BMR087")
+        result = fetch_result.holdings
 
         assert result is not None
         # Only 5 rows have weight > 0 (Apple, Microsoft, Amazon, NVIDIA, Alphabet)
@@ -331,7 +346,8 @@ class TestFetchJustETFZeroWeightExclusion:
         """Holdings with negative weight should be excluded from results."""
         mock_get.return_value = _mock_response(HOLDINGS_WITH_ZERO_WEIGHT_HTML)
 
-        result = _fetch_justetf("IE00B5BMR087")
+        fetch_result = _fetch_justetf("IE00B5BMR087")
+        result = fetch_result.holdings
 
         assert result is not None
         # The row with -0.50% should be excluded
@@ -346,7 +362,8 @@ class TestFetchJustETFHTTPFailure:
         """Non-200 HTTP status should return None."""
         mock_get.return_value = _mock_response("", status_code=404)
 
-        result = _fetch_justetf("IE00B5BMR087")
+        fetch_result = _fetch_justetf("IE00B5BMR087")
+        result = fetch_result.holdings
 
         assert result is None
 
@@ -355,7 +372,8 @@ class TestFetchJustETFHTTPFailure:
         """Server error (500) should return None."""
         mock_get.return_value = _mock_response("Internal Server Error", status_code=500)
 
-        result = _fetch_justetf("IE00B5BMR087")
+        fetch_result = _fetch_justetf("IE00B5BMR087")
+        result = fetch_result.holdings
 
         assert result is None
 
@@ -364,7 +382,8 @@ class TestFetchJustETFHTTPFailure:
         """Connection errors should return None."""
         mock_get.side_effect = requests.exceptions.ConnectionError("Connection refused")
 
-        result = _fetch_justetf("IE00B5BMR087")
+        fetch_result = _fetch_justetf("IE00B5BMR087")
+        result = fetch_result.holdings
 
         assert result is None
 
@@ -373,7 +392,8 @@ class TestFetchJustETFHTTPFailure:
         """Timeout errors should return None."""
         mock_get.side_effect = requests.exceptions.Timeout("Request timed out")
 
-        result = _fetch_justetf("IE00B5BMR087")
+        fetch_result = _fetch_justetf("IE00B5BMR087")
+        result = fetch_result.holdings
 
         assert result is None
 
@@ -386,7 +406,8 @@ class TestFetchJustETFMultipleTables:
         """When page has multiple tables, the valid holdings table is identified."""
         mock_get.return_value = _mock_response(MULTIPLE_TABLES_HTML)
 
-        result = _fetch_justetf("IE00B5BMR087")
+        fetch_result = _fetch_justetf("IE00B5BMR087")
+        result = fetch_result.holdings
 
         assert result is not None
         # Should find the holdings table (7 rows with valid holdings)
@@ -428,7 +449,8 @@ class TestFetchJustETFMultipleTables:
         """
         mock_get.return_value = _mock_response(html)
 
-        result = _fetch_justetf("IE00B5BMR087")
+        fetch_result = _fetch_justetf("IE00B5BMR087")
+        result = fetch_result.holdings
 
         assert result is not None
         assert len(result) == 6

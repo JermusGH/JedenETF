@@ -72,8 +72,9 @@ class TestVanguardSuccessfulParsing:
         mock_response.json.return_value = _make_graphql_response(REALISTIC_HOLDINGS_ITEMS)
 
         with patch("etf_holdings.requests.post", return_value=mock_response) as mock_post:
-            result = _fetch_vanguard("IE00BK5BQT80")
+            fetch_result = _fetch_vanguard("IE00BK5BQT80")
 
+        result = fetch_result.holdings
         assert result is not None
         assert isinstance(result, pd.DataFrame)
         assert list(result.columns) == ["ticker", "name", "weight"]
@@ -117,8 +118,9 @@ class TestVanguardSuccessfulParsing:
         mock_response.json.return_value = _make_graphql_response(REALISTIC_HOLDINGS_ITEMS)
 
         with patch("etf_holdings.requests.post", return_value=mock_response):
-            result = _fetch_vanguard("IE00BK5BQT80")
+            fetch_result = _fetch_vanguard("IE00BK5BQT80")
 
+        result = fetch_result.holdings
         assert result is not None
         assert result["weight"].dtype == float
 
@@ -143,7 +145,7 @@ class TestVanguardMissingTicker:
         mock_response.json.return_value = _make_graphql_response(items)
 
         with patch("etf_holdings.requests.post", return_value=mock_response):
-            result = _fetch_vanguard("IE00BK5BQT80")
+            result = _fetch_vanguard("IE00BK5BQT80").holdings
 
         assert result is not None
         assert len(result) == 3
@@ -162,7 +164,7 @@ class TestVanguardMissingTicker:
         mock_response.json.return_value = _make_graphql_response(items)
 
         with patch("etf_holdings.requests.post", return_value=mock_response):
-            result = _fetch_vanguard("IE00BK5BQT80")
+            result = _fetch_vanguard("IE00BK5BQT80").holdings
 
         assert result is not None
         assert result.iloc[0]["ticker"] == "N/A"
@@ -189,7 +191,7 @@ class TestVanguardEmptyNames:
         mock_response.json.return_value = _make_graphql_response(items)
 
         with patch("etf_holdings.requests.post", return_value=mock_response):
-            result = _fetch_vanguard("IE00BK5BQT80")
+            result = _fetch_vanguard("IE00BK5BQT80").holdings
 
         assert result is not None
         assert len(result) == 2
@@ -209,14 +211,14 @@ class TestVanguardEmptyNames:
         mock_response.json.return_value = _make_graphql_response(items)
 
         with patch("etf_holdings.requests.post", return_value=mock_response):
-            result = _fetch_vanguard("IE00BK5BQT80")
+            result = _fetch_vanguard("IE00BK5BQT80").holdings
 
         assert result is not None
         assert len(result) == 1
         assert result.iloc[0]["name"] == "Apple Inc"
 
     def test_all_empty_names_returns_none(self):
-        """If all holdings have empty names, result after filtering is empty → returns None."""
+        """If all holdings have empty names, result after filtering is None."""
         items = [
             {"ticker": "X", "issuerName": "", "marketValuePercentage": 1.0},
             {"ticker": "Y", "issuerName": "   ", "marketValuePercentage": 2.0},
@@ -228,14 +230,8 @@ class TestVanguardEmptyNames:
         with patch("etf_holdings.requests.post", return_value=mock_response):
             result = _fetch_vanguard("IE00BK5BQT80")
 
-        # After filtering all empty names, the DataFrame is empty
-        # The function returns a DataFrame (possibly empty) — check behavior
-        # Based on the code: df[df["name"].str.strip() != ""].reset_index(drop=True)
-        # This returns an empty DataFrame, not None
-        # But per Req 5.5: empty holdings → return None
-        # The code doesn't check for empty after filtering, so it returns empty DF
-        assert result is not None
-        assert len(result) == 0
+        # After filtering all empty names, the DataFrame is empty → holdings is None
+        assert result.holdings is None
 
 
 # ---------------------------------------------------------------------------
@@ -258,7 +254,7 @@ class TestVanguardErrorResponse:
         with patch("etf_holdings.requests.post", return_value=mock_response):
             result = _fetch_vanguard("IE00INVALID00")
 
-        assert result is None
+        assert result.holdings is None
 
     def test_http_error_returns_none(self):
         """HTTP error (e.g. 500) should result in None."""
@@ -268,21 +264,21 @@ class TestVanguardErrorResponse:
         with patch("etf_holdings.requests.post", return_value=mock_response):
             result = _fetch_vanguard("IE00BK5BQT80")
 
-        assert result is None
+        assert result.holdings is None
 
     def test_connection_timeout_returns_none(self):
         """Connection timeout should result in None."""
         with patch("etf_holdings.requests.post", side_effect=Exception("Connection timed out")):
             result = _fetch_vanguard("IE00BK5BQT80")
 
-        assert result is None
+        assert result.holdings is None
 
     def test_network_error_returns_none(self):
         """Network error should result in None."""
         with patch("etf_holdings.requests.post", side_effect=ConnectionError("Network unreachable")):
             result = _fetch_vanguard("IE00BK5BQT80")
 
-        assert result is None
+        assert result.holdings is None
 
 
 # ---------------------------------------------------------------------------
@@ -302,7 +298,7 @@ class TestVanguardUnexpectedStructure:
         with patch("etf_holdings.requests.post", return_value=mock_response):
             result = _fetch_vanguard("IE00BK5BQT80")
 
-        assert result is None
+        assert result.holdings is None
 
     def test_missing_borholdings_key_returns_none(self):
         """Response without 'borHoldings' in data should return None."""
@@ -313,7 +309,7 @@ class TestVanguardUnexpectedStructure:
         with patch("etf_holdings.requests.post", return_value=mock_response):
             result = _fetch_vanguard("IE00BK5BQT80")
 
-        assert result is None
+        assert result.holdings is None
 
     def test_empty_borholdings_array_returns_none(self):
         """Empty borHoldings array should return None."""
@@ -324,7 +320,7 @@ class TestVanguardUnexpectedStructure:
         with patch("etf_holdings.requests.post", return_value=mock_response):
             result = _fetch_vanguard("IE00BK5BQT80")
 
-        assert result is None
+        assert result.holdings is None
 
     def test_missing_holdings_key_returns_none(self):
         """borHoldings entry without 'holdings' key should return None."""
@@ -335,7 +331,7 @@ class TestVanguardUnexpectedStructure:
         with patch("etf_holdings.requests.post", return_value=mock_response):
             result = _fetch_vanguard("IE00BK5BQT80")
 
-        assert result is None
+        assert result.holdings is None
 
     def test_null_data_returns_none(self):
         """Null data field should return None."""
@@ -346,7 +342,7 @@ class TestVanguardUnexpectedStructure:
         with patch("etf_holdings.requests.post", return_value=mock_response):
             result = _fetch_vanguard("IE00BK5BQT80")
 
-        assert result is None
+        assert result.holdings is None
 
 
 # ---------------------------------------------------------------------------
@@ -366,7 +362,7 @@ class TestVanguardEmptyHoldings:
         with patch("etf_holdings.requests.post", return_value=mock_response):
             result = _fetch_vanguard("IE00BK5BQT80")
 
-        assert result is None
+        assert result.holdings is None
 
     def test_null_items_returns_none(self):
         """Null items field should return None."""
@@ -384,4 +380,4 @@ class TestVanguardEmptyHoldings:
         with patch("etf_holdings.requests.post", return_value=mock_response):
             result = _fetch_vanguard("IE00BK5BQT80")
 
-        assert result is None
+        assert result.holdings is None

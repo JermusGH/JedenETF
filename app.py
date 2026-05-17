@@ -4,16 +4,23 @@ Unified ETF Portfolio Dashboard — Streamlit App
 Run with:  streamlit run app.py
 """
 
+import logging
 import urllib.parse
 
+import altair as alt
 import pandas as pd
+import plotly.express as px
 import streamlit as st
 
 from analysis import enrich_holdings, merge_holdings
-from etf_holdings import clear_justetf_tickers, fetch_holdings, get_justetf_tickers
-from name_normaliser import normalise_name
-from portfolio import SUPPORTED_CURRENCIES, TARGET_CURRENCY, fetch_prices, get_fund_family
+from etf_holdings import HoldingsFetcher, detect_provider
+from holding_metadata import fetch_holdings_metadata
+from models import AnalysisResult
+from portfolio import SUPPORTED_CURRENCIES, TARGET_CURRENCY
+from pricing import fetch_prices, get_fund_family
 from validation import validate_holdings_csv, validate_ticker
+
+logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Provider detection helpers
@@ -31,27 +38,12 @@ def _github_issue_url(title: str, body: str = "") -> str:
 
 
 def _detect_ticker_provider(ticker: str) -> str:
-    """Detect the provider for a ticker. Returns 'ishares', 'vanguard', 'invesco', 'xtrackers', 'amundi', or 'unknown'."""
+    """Detect the provider for a ticker using Yahoo Finance fund family metadata."""
     try:
-        family = get_fund_family(ticker).lower()
-        if "blackrock" in family or "ishares" in family:
-            return "ishares"
-        if "vanguard" in family:
-            return "vanguard"
-        if "invesco" in family:
-            return "invesco"
-        if "dws" in family or "xtrackers" in family:
-            return "xtrackers"
-        if "amundi" in family:
-            return "amundi"
+        family = get_fund_family(ticker)
+        return detect_provider(family)
     except Exception:
-        pass
-    return "unknown"
-
-
-def _validate_holdings_csv(file) -> tuple[pd.DataFrame | None, str]:
-    """Validate an uploaded CSV file for custom holdings. Delegates to validation module."""
-    return validate_holdings_csv(file)
+        return "unknown"
 
 # ---------------------------------------------------------------------------
 # Page config
@@ -63,10 +55,10 @@ st.set_page_config(page_title="Unified ETF Portfolio", layout="wide")
 # Analysis logic
 # ---------------------------------------------------------------------------
 
-def run_analysis(portfolio: dict[str, float], target_currency: str = "PLN") -> tuple[pd.DataFrame, float, list[str], list[str], list[str]]:
+def run_analysis(portfolio: dict[str, float], target_currency: str = "PLN") -> AnalysisResult:
     """Fetch prices and holdings, merge into unified DataFrame.
 
-    Returns (final_df, total_value, sources, failed_tickers, justetf_tickers).
+    Returns an AnalysisResult dataclass.
     """
     tickers = list(portfolio.keys())
     prices = fetch_prices(tickers, target_currency=target_currency)
@@ -75,7 +67,7 @@ def run_analysis(portfolio: dict[str, float], target_currency: str = "PLN") -> t
     total_value = 0.0
     failed_tickers: list[str] = []
 
-    clear_justetf_tickers()
+    fetcher = HoldingsFetcher()
 
     progress = st.progress(0, text="Loading holdings...")
     for i, (ticker, units) in enumerate(portfolio.items()):
@@ -95,7 +87,7 @@ def run_analysis(portfolio: dict[str, float], target_currency: str = "PLN") -> t
             df = st.session_state.custom_holdings[ticker].copy()
         else:
             fund_family = get_fund_family(ticker)
-            df = fetch_holdings(yf_ticker=ticker, fund_family=fund_family)
+            df = fetcher.fetch(yf_ticker=ticker, fund_family=fund_family)
 
         if df is None or df.empty:
             failed_tickers.append(ticker)
@@ -107,15 +99,26 @@ def run_analysis(portfolio: dict[str, float], target_currency: str = "PLN") -> t
 
     progress.empty()
 
-    justetf_tickers = sorted(get_justetf_tickers())
+    justetf_tickers = sorted(fetcher.justetf_tickers)
 
     if not frames or total_value == 0:
-        return pd.DataFrame(), 0.0, [], failed_tickers, justetf_tickers
+        return AnalysisResult(
+            df=pd.DataFrame(),
+            total_value=0.0,
+            failed_tickers=failed_tickers,
+            justetf_tickers=justetf_tickers,
+        )
 
     sources = sorted(set(s for f in frames for s in f["source"].unique()))
     final = merge_holdings(frames, total_value)
     final = final.sort_values("weight_%", ascending=False)
-    return final, total_value, sources, failed_tickers, justetf_tickers
+    return AnalysisResult(
+        df=final,
+        total_value=total_value,
+        sources=sources,
+        failed_tickers=failed_tickers,
+        justetf_tickers=justetf_tickers,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -259,7 +262,7 @@ def show_portfolio_editor():
                     label_visibility="collapsed",
                 )
                 if uploaded is not None and ticker not in st.session_state.custom_holdings:
-                    df, error = _validate_holdings_csv(uploaded)
+                    df, error = validate_holdings_csv(uploaded)
                     if error:
                         st.error(error)
                     else:
@@ -307,8 +310,8 @@ def show_portfolio_editor():
         st.info(f"**{len(active)} ETFs** ready for analysis")
         if st.button("Analyse Portfolio", type="primary", use_container_width=True):
             with st.spinner("Fetching data..."):
-                final_df, total_value, sources, failed, justetf = run_analysis(active, target_currency=st.session_state.target_currency)
-            st.session_state.results = (final_df, total_value, sources, failed, justetf)
+                result = run_analysis(active, target_currency=st.session_state.target_currency)
+            st.session_state.results = result
             st.rerun()
     else:
         st.caption("Add at least one ETF to get started.")
@@ -338,23 +341,13 @@ def show_portfolio_editor():
 # ---------------------------------------------------------------------------
 
 def show_results():
-    result_data = st.session_state.results
-    # Support old (3-tuple), mid (4-tuple), and new (5-tuple) format
-    if len(result_data) == 5:
-        final_df, total_value, sources, failed_tickers, justetf_tickers = result_data
-    elif len(result_data) == 4:
-        final_df, total_value, sources, failed_tickers = result_data
-        justetf_tickers = []
-    else:
-        final_df, total_value, sources = result_data
-        failed_tickers = []
-        justetf_tickers = []
+    result: AnalysisResult = st.session_state.results
 
-    if final_df.empty:
+    if result.is_empty:
         st.error("Could not fetch holdings for any ETF. Check tickers and internet connection.")
-        if failed_tickers:
+        if result.failed_tickers:
             st.warning(
-                f"**Failed tickers:** {', '.join(failed_tickers)}\n\n"
+                f"**Failed tickers:** {', '.join(result.failed_tickers)}\n\n"
                 "Swap-based, money market, and commodity ETFs do not hold individual "
                 "securities and cannot be analysed by this tool."
             )
@@ -362,6 +355,12 @@ def show_results():
             st.session_state.results = None
             st.rerun()
         return
+
+    final_df = result.df
+    total_value = result.total_value
+    sources = result.sources
+    failed_tickers = result.failed_tickers
+    justetf_tickers = result.justetf_tickers
 
     # Header
     st.title("Portfolio Analysis")
@@ -407,27 +406,162 @@ def show_results():
         use_container_width=True,
     )
 
-    # Charts
+    # Sector & Country Distribution
     st.markdown("---")
+
+    # Resolve metadata for holdings
+    holding_tickers = final_df["ticker"].tolist()
+    with st.spinner("Resolving sector & country data..."):
+        metadata = fetch_holdings_metadata(holding_tickers)
+
+    # Build sector and country distribution data
+    sector_rows = []
+    country_rows = []
+    for _, row in final_df.iterrows():
+        ticker = row["ticker"]
+        meta = metadata.get(ticker)
+        if meta:
+            sector_rows.append({"sector": meta["sector"], "weight_%": row["weight_%"], "value": row["value"]})
+            country_rows.append({"country": meta["country"], "weight_%": row["weight_%"], "value": row["value"]})
+
+    # Charts row
     chart_col1, chart_col2 = st.columns(2)
 
     with chart_col1:
-        st.subheader("Weight Distribution (Top 15)")
-        chart_data = final_df.head(15)[["name", "weight_%"]].set_index("name")
-        st.bar_chart(chart_data, horizontal=True)
+        st.subheader("Sector Distribution")
+        if sector_rows:
+            sector_df = pd.DataFrame(sector_rows)
+            sector_agg = sector_df.groupby("sector", as_index=False).agg(
+                {"weight_%": "sum", "value": "sum"}
+            ).sort_values("weight_%", ascending=False)
+
+            # Top 5 + Other for pie chart
+            top5_sectors = sector_agg.head(5).copy()
+            other_weight = sector_agg.iloc[5:]["weight_%"].sum()
+            other_value = sector_agg.iloc[5:]["value"].sum()
+            if other_weight > 0:
+                other_row = pd.DataFrame([{"sector": "Other", "weight_%": other_weight, "value": other_value}])
+                pie_data = pd.concat([top5_sectors, other_row], ignore_index=True)
+            else:
+                pie_data = top5_sectors
+
+            pie_chart = (
+                alt.Chart(pie_data)
+                .mark_arc(innerRadius=50)
+                .encode(
+                    theta=alt.Theta("weight_%:Q", title="Weight (%)"),
+                    color=alt.Color("sector:N", title="Sector"),
+                    tooltip=[
+                        alt.Tooltip("sector:N", title="Sector"),
+                        alt.Tooltip("weight_%:Q", title="Weight (%)", format=".2f"),
+                    ],
+                )
+                .properties(height=300)
+            )
+            st.altair_chart(pie_chart, use_container_width=True)
+
+            # Table below
+            sector_agg = sector_agg.reset_index(drop=True)
+            sector_agg.index += 1
+            currency = st.session_state.target_currency
+            display_sector = sector_agg.rename(columns={
+                "sector": "Sector",
+                "weight_%": "Weight (%)",
+                "value": f"Value ({currency})",
+            })
+            st.dataframe(
+                display_sector.style.format({
+                    "Weight (%)": "{:.2f}%",
+                    f"Value ({currency})": "{:,.0f}",
+                }),
+                use_container_width=True,
+            )
+        else:
+            st.caption("No sector data available.")
 
     with chart_col2:
-        st.subheader("ETF Contribution")
-        if sources:
-            source_totals = final_df[sources].sum().reset_index()
-            source_totals.columns = ["ETF", "Weight (%)"]
-            source_totals = source_totals.set_index("ETF")
-            st.bar_chart(source_totals)
+        st.subheader("Country Distribution")
+        if country_rows:
+            country_df = pd.DataFrame(country_rows)
+            country_agg = country_df.groupby("country", as_index=False).agg(
+                {"weight_%": "sum", "value": "sum"}
+            ).sort_values("weight_%", ascending=False)
+
+            # Country name to ISO-3 code mapping for the choropleth
+            country_to_iso3 = {
+                "United States": "USA", "Japan": "JPN", "China": "CHN",
+                "Canada": "CAN", "Taiwan": "TWN", "Korea (South)": "KOR",
+                "United Kingdom": "GBR", "Germany": "DEU", "France": "FRA",
+                "Australia": "AUS", "Switzerland": "CHE", "Sweden": "SWE",
+                "Netherlands": "NLD", "Hong Kong": "HKG", "South Africa": "ZAF",
+                "Italy": "ITA", "Spain": "ESP", "Singapore": "SGP",
+                "Mexico": "MEX", "Indonesia": "IDN", "Israel": "ISR",
+                "Denmark": "DNK", "United Arab Emirates": "ARE", "Malaysia": "MYS",
+                "Finland": "FIN", "Poland": "POL", "Norway": "NOR",
+                "Turkey": "TUR", "Belgium": "BEL", "Russian Federation": "RUS",
+                "Thailand": "THA", "Ireland": "IRL", "Qatar": "QAT",
+                "Portugal": "PRT", "Philippines": "PHL", "New Zealand": "NZL",
+                "Austria": "AUT", "Chile": "CHL", "Greece": "GRC",
+                "Peru": "PER", "Kuwait": "KWT", "Czech Republic": "CZE",
+                "Hungary": "HUN", "Egypt": "EGY", "Brazil": "BRA",
+                "India": "IND", "Colombia": "COL", "Saudi Arabia": "SAU",
+            }
+
+            map_data = country_agg.copy()
+            map_data["iso3"] = map_data["country"].map(country_to_iso3)
+            map_data = map_data[map_data["iso3"].notna()]
+
+            if not map_data.empty:
+                fig = px.choropleth(
+                    map_data,
+                    locations="iso3",
+                    color="weight_%",
+                    hover_name="country",
+                    hover_data={"weight_%": ":.2f", "iso3": False},
+                    color_continuous_scale="Blues",
+                    labels={"weight_%": "Weight (%)"},
+                )
+                fig.update_layout(
+                    margin=dict(l=0, r=0, t=0, b=0),
+                    height=300,
+                    geo=dict(showframe=False, showcoastlines=True, projection_type="natural earth"),
+                    coloraxis_colorbar=dict(title="Weight %"),
+                )
+                st.plotly_chart(fig, use_container_width=True)
+
+            # Table below
+            country_agg = country_agg.reset_index(drop=True)
+            country_agg.index += 1
+            currency = st.session_state.target_currency
+            display_country = country_agg.rename(columns={
+                "country": "Country",
+                "weight_%": "Weight (%)",
+                "value": f"Value ({currency})",
+            })
+            st.dataframe(
+                display_country.style.format({
+                    "Weight (%)": "{:.2f}%",
+                    f"Value ({currency})": "{:,.0f}",
+                }),
+                use_container_width=True,
+            )
+        else:
+            st.caption("No country data available.")
+
+    # Coverage info
+    resolved_weight = sum(r["weight_%"] for r in sector_rows)
+    if resolved_weight < 95:
+        st.caption(
+            f"Coverage: {resolved_weight:.1f}% of portfolio weight resolved. "
+            f"Remaining holdings lack sector/country data."
+        )
 
     # Per-ETF breakdown
     st.markdown("---")
     st.subheader("Per-ETF Contribution (Top 20)")
     contrib_df = top20[["name"] + sources].copy().set_index("name")
+    # Add Total % column as sum of all ETF contributions (second position)
+    contrib_df.insert(0, "Total %", contrib_df.sum(axis=1))
     contrib_display = contrib_df.map(lambda x: f"{x:.2f}%" if x > 0.01 else "—")
     st.dataframe(contrib_display, use_container_width=True)
 

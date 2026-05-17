@@ -18,6 +18,7 @@ import pandas as pd
 import pytest
 
 from main import _print_report, main
+from models import AnalysisResult
 
 
 # ---------------------------------------------------------------------------
@@ -69,7 +70,7 @@ class TestPrintReportSorting:
         # Shuffle the DataFrame so sorting is actually tested
         df = df.sample(frac=1, random_state=42).reset_index(drop=True)
 
-        _print_report(df, 10000.0, sources)
+        _print_report(AnalysisResult(df=df, total_value=10000.0, sources=sources))
 
         captured = capsys.readouterr().out
         lines = captured.strip().split("\n")
@@ -107,7 +108,7 @@ class TestPrintReportSorting:
         sources = ["ETF_A"]
         df = _make_final_df(30, sources)
 
-        _print_report(df, 10000.0, sources)
+        _print_report(AnalysisResult(df=df, total_value=10000.0, sources=sources))
 
         captured = capsys.readouterr().out
         lines = captured.strip().split("\n")
@@ -125,7 +126,7 @@ class TestPrintReportColumnAlignment:
         sources = ["ETF_A"]
         df = _make_final_df(5, sources)
 
-        _print_report(df, 5000.0, sources)
+        _print_report(AnalysisResult(df=df, total_value=5000.0, sources=sources))
 
         captured = capsys.readouterr().out
         lines = captured.strip().split("\n")
@@ -148,7 +149,7 @@ class TestPrintReportColumnAlignment:
         sources = ["CSPX.L", "VWCE.DE"]
         df = _make_final_df(5, sources)
 
-        _print_report(df, 5000.0, sources)
+        _print_report(AnalysisResult(df=df, total_value=5000.0, sources=sources))
 
         captured = capsys.readouterr().out
 
@@ -160,7 +161,7 @@ class TestPrintReportColumnAlignment:
         sources = ["ETF_A"]
         df = _make_final_df(5, sources)
 
-        _print_report(df, 5000.0, sources)
+        _print_report(AnalysisResult(df=df, total_value=5000.0, sources=sources))
 
         captured = capsys.readouterr().out
         lines = captured.strip().split("\n")
@@ -190,7 +191,7 @@ class TestPrintReportContributionFormatting:
             },
         ])
 
-        _print_report(df, 10000.0, sources)
+        _print_report(AnalysisResult(df=df, total_value=10000.0, sources=sources))
 
         captured = capsys.readouterr().out
         lines = [l for l in captured.split("\n") if "AAPL" in l]
@@ -215,7 +216,7 @@ class TestPrintReportContributionFormatting:
             },
         ])
 
-        _print_report(df, 10000.0, sources)
+        _print_report(AnalysisResult(df=df, total_value=10000.0, sources=sources))
 
         captured = capsys.readouterr().out
         lines = [l for l in captured.split("\n") if "MSFT" in l]
@@ -238,7 +239,7 @@ class TestPrintReportContributionFormatting:
             },
         ])
 
-        _print_report(df, 10000.0, sources)
+        _print_report(AnalysisResult(df=df, total_value=10000.0, sources=sources))
 
         captured = capsys.readouterr().out
         lines = [l for l in captured.split("\n") if "GOOG" in l]
@@ -255,7 +256,7 @@ class TestPrintReportTotalAndCount:
         sources = ["ETF_A"]
         df = _make_final_df(5, sources)
 
-        _print_report(df, 12345.67, sources)
+        _print_report(AnalysisResult(df=df, total_value=12345.67, sources=sources))
 
         captured = capsys.readouterr().out
         assert "12,345.67" in captured
@@ -266,7 +267,7 @@ class TestPrintReportTotalAndCount:
         sources = ["ETF_A"]
         df = _make_final_df(8, sources)
 
-        _print_report(df, 5000.0, sources)
+        _print_report(AnalysisResult(df=df, total_value=5000.0, sources=sources))
 
         captured = capsys.readouterr().out
         # The full DataFrame has 8 holdings
@@ -306,14 +307,15 @@ class TestMainNoHoldings:
     @patch("main.PORTFOLIO", {"CSPX.L": 0.0, "VWCE.DE": 5.0})
     @patch("main.fetch_prices")
     @patch("main.get_fund_family")
-    @patch("main.fetch_holdings")
+    @patch("main.HoldingsFetcher")
     def test_no_holdings_prints_error(
-        self, mock_holdings, mock_family, mock_prices, capsys
+        self, mock_fetcher_cls, mock_family, mock_prices, capsys
     ):
         """When fetch_holdings returns None for all ETFs, error is printed."""
         mock_prices.return_value = {"CSPX.L": 0.0, "VWCE.DE": 50.0}
         mock_family.return_value = "ishares"
-        mock_holdings.return_value = None
+        mock_fetcher_cls.return_value.fetch.return_value = None
+        mock_fetcher_cls.return_value.justetf_tickers = set()
 
         main()
 
@@ -323,14 +325,15 @@ class TestMainNoHoldings:
     @patch("main.PORTFOLIO", {"CSPX.L": 0.0})
     @patch("main.fetch_prices")
     @patch("main.get_fund_family")
-    @patch("main.fetch_holdings")
+    @patch("main.HoldingsFetcher")
     def test_no_holdings_no_table_printed(
-        self, mock_holdings, mock_family, mock_prices, capsys
+        self, mock_fetcher_cls, mock_family, mock_prices, capsys
     ):
         """When no holdings are available, no table should be printed."""
         mock_prices.return_value = {"CSPX.L": 0.0}
         mock_family.return_value = "vanguard"
-        mock_holdings.return_value = pd.DataFrame()  # empty DataFrame
+        mock_fetcher_cls.return_value.fetch.return_value = pd.DataFrame()
+        mock_fetcher_cls.return_value.justetf_tickers = set()
 
         main()
 

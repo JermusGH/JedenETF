@@ -5,6 +5,7 @@ Merges holdings from multiple ETFs into a single unified view,
 showing your true exposure to individual companies across all funds.
 """
 
+import logging
 import sys
 
 import pandas as pd
@@ -18,8 +19,12 @@ except ImportError:
     sys.exit(1)
 
 from analysis import enrich_holdings, merge_holdings
-from etf_holdings import fetch_holdings
-from portfolio import PORTFOLIO, TARGET_CURRENCY, fetch_prices, get_fund_family
+from etf_holdings import HoldingsFetcher
+from models import AnalysisResult
+from portfolio import PORTFOLIO, TARGET_CURRENCY
+from pricing import fetch_prices, get_fund_family
+
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -29,14 +34,16 @@ from portfolio import PORTFOLIO, TARGET_CURRENCY, fetch_prices, get_fund_family
 def _build_unified_portfolio(
     portfolio: dict[str, float],
     prices: dict[str, float | None],
-) -> tuple[pd.DataFrame, float, list[pd.DataFrame]]:
+) -> AnalysisResult:
     """
     Fetch holdings for each ETF and enrich with values.
 
-    Returns (merged_df, total_portfolio_value, enriched_frames).
+    Returns an AnalysisResult with the merged DataFrame and metadata.
     """
     frames: list[pd.DataFrame] = []
     total_value = 0.0
+    failed_tickers: list[str] = []
+    fetcher = HoldingsFetcher()
 
     for ticker, units in portfolio.items():
         if units <= 0:
@@ -44,20 +51,22 @@ def _build_unified_portfolio(
 
         price = prices.get(ticker)
         if price is None:
-            print(f"\n  [!] No price for {ticker} — skipping")
+            logger.warning("No price for %s — skipping", ticker)
+            failed_tickers.append(ticker)
             continue
 
         etf_value = units * price
         fund_family = get_fund_family(ticker)
 
-        print(
-            f"\n  {ticker} | Price: {price:.2f} {TARGET_CURRENCY} | "
-            f"Units: {units} | Value: {etf_value:.2f} {TARGET_CURRENCY}"
+        logger.info(
+            "%s | Price: %.2f %s | Units: %s | Value: %.2f %s",
+            ticker, price, TARGET_CURRENCY, units, etf_value, TARGET_CURRENCY,
         )
 
-        df = fetch_holdings(yf_ticker=ticker, fund_family=fund_family)
+        df = fetcher.fetch(yf_ticker=ticker, fund_family=fund_family)
         if df is None or df.empty:
-            print("  [!] Failed to fetch holdings")
+            logger.warning("Failed to fetch holdings for %s", ticker)
+            failed_tickers.append(ticker)
             continue
 
         enriched = enrich_holdings(df, etf_value, ticker)
@@ -65,19 +74,33 @@ def _build_unified_portfolio(
         frames.append(enriched)
 
     if not frames:
-        return pd.DataFrame(), 0.0, []
+        return AnalysisResult(
+            df=pd.DataFrame(),
+            total_value=0.0,
+            failed_tickers=failed_tickers,
+            justetf_tickers=sorted(fetcher.justetf_tickers),
+        )
 
     final = merge_holdings(frames, total_value)
-    return final, total_value, frames
+    sources = sorted(set(s for f in frames for s in f["source"].unique()))
+
+    return AnalysisResult(
+        df=final,
+        total_value=total_value,
+        sources=sources,
+        failed_tickers=failed_tickers,
+        justetf_tickers=sorted(fetcher.justetf_tickers),
+    )
 
 
 # ---------------------------------------------------------------------------
 # Reporting
 # ---------------------------------------------------------------------------
 
-def _print_report(final: pd.DataFrame, total_value: float, sources: list[str]) -> list[str]:
+def _print_report(result: AnalysisResult) -> list[str]:
     """Print a formatted top-20 table and return the lines for file output."""
-    top20 = final.nlargest(20, "weight_%")
+    top20 = result.df.nlargest(20, "weight_%")
+    sources = result.sources
 
     COL_TICKER = min(max(12, top20["ticker"].astype(str).str.len().max()), 20)
     COL_NAME = min(max(14, top20["name"].astype(str).str.len().max()), 40)
@@ -128,8 +151,8 @@ def _print_report(final: pd.DataFrame, total_value: float, sources: list[str]) -
         )
 
     emit(sep)
-    emit(f"Total portfolio value: {total_value:,.2f} {TARGET_CURRENCY}")
-    emit(f"Unique holdings (merged): {len(final)}")
+    emit(f"Total portfolio value: {result.total_value:,.2f} {TARGET_CURRENCY}")
+    emit(f"Unique holdings (merged): {len(result.df)}")
     return lines
 
 
@@ -138,6 +161,8 @@ def _print_report(final: pd.DataFrame, total_value: float, sources: list[str]) -
 # ---------------------------------------------------------------------------
 
 def main():
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
+
     if not PORTFOLIO:
         print("[!] PORTFOLIO is empty. Add ETFs to portfolio.py")
         return
@@ -147,15 +172,12 @@ def main():
 
     print("\n--- UNIFIED ETF PORTFOLIO ANALYSIS ---")
 
-    final, total_value, frames = _build_unified_portfolio(PORTFOLIO, prices)
-    if final.empty:
+    result = _build_unified_portfolio(PORTFOLIO, prices)
+    if result.is_empty:
         print("\n[!] No holdings data available for analysis.")
         return
 
-    # Determine sources from the enriched frames
-    sources = sorted(set(s for f in frames for s in f["source"].unique()))
-
-    lines = _print_report(final, total_value, sources)
+    _print_report(result)
 
 
 if __name__ == "__main__":

@@ -8,7 +8,8 @@ import pandas as pd
 import pytest
 from unittest.mock import patch, MagicMock
 
-from etf_holdings import _fetch_ishares, _discover_ishares_product_id, fetch_holdings
+from etf_holdings import _fetch_ishares, _discover_ishares_product_id, fetch_holdings, _default_fetcher
+from models import FetchResult
 
 
 # ---------------------------------------------------------------------------
@@ -77,7 +78,8 @@ class TestFetchIsharesSuccess:
         mock_response.text = REALISTIC_ISHARES_CSV
         mock_get.return_value = mock_response
 
-        result = _fetch_ishares("253743")
+        fetch_result = _fetch_ishares("253743")
+        result = fetch_result.holdings
 
         assert result is not None
         assert isinstance(result, pd.DataFrame)
@@ -92,7 +94,7 @@ class TestFetchIsharesSuccess:
         mock_response.text = REALISTIC_ISHARES_CSV
         mock_get.return_value = mock_response
 
-        result = _fetch_ishares("253743")
+        result = _fetch_ishares("253743").holdings
 
         assert result["ticker"].tolist() == ["AAPL", "MSFT", "NVDA", "AMZN", "GOOGL"]
 
@@ -104,7 +106,7 @@ class TestFetchIsharesSuccess:
         mock_response.text = REALISTIC_ISHARES_CSV
         mock_get.return_value = mock_response
 
-        result = _fetch_ishares("253743")
+        result = _fetch_ishares("253743").holdings
 
         assert result["name"].tolist() == [
             "Apple Inc",
@@ -122,7 +124,7 @@ class TestFetchIsharesSuccess:
         mock_response.text = REALISTIC_ISHARES_CSV
         mock_get.return_value = mock_response
 
-        result = _fetch_ishares("253743")
+        result = _fetch_ishares("253743").holdings
 
         expected_weights = [8.24, 7.15, 5.89, 4.50, 3.80]
         assert result["weight"].tolist() == pytest.approx(expected_weights)
@@ -135,7 +137,7 @@ class TestFetchIsharesSuccess:
         mock_response.text = REALISTIC_ISHARES_CSV
         mock_get.return_value = mock_response
 
-        result = _fetch_ishares("253743")
+        result = _fetch_ishares("253743").holdings
 
         # Should not contain metadata like "iShares Core S&P 500" as a row
         assert "iShares Core S&P 500 UCITS ETF" not in result["name"].tolist()
@@ -156,7 +158,7 @@ class TestFetchIsharesEmptyNames:
         mock_response.text = ISHARES_CSV_WITH_EMPTY_NAMES
         mock_get.return_value = mock_response
 
-        result = _fetch_ishares("253743")
+        result = _fetch_ishares("253743").holdings
 
         assert result is not None
         # MSFT has empty name "", CASH has whitespace-only name "   "
@@ -174,7 +176,7 @@ class TestFetchIsharesEmptyNames:
         mock_response.text = ISHARES_CSV_WITH_EMPTY_NAMES
         mock_get.return_value = mock_response
 
-        result = _fetch_ishares("253743")
+        result = _fetch_ishares("253743").holdings
 
         # No name should be empty or whitespace-only
         for name in result["name"].tolist():
@@ -196,7 +198,7 @@ class TestFetchIsharesNonNumericWeights:
         mock_response.text = ISHARES_CSV_WITH_NON_NUMERIC_WEIGHTS
         mock_get.return_value = mock_response
 
-        result = _fetch_ishares("253743")
+        result = _fetch_ishares("253743").holdings
 
         assert result is not None
         # AAPL=8.24, MSFT=0.0 (N/A), NVDA=0.0 (-), AMZN=4.50
@@ -223,7 +225,7 @@ class TestFetchIsharesHttpError:
 
         result = _fetch_ishares("253743")
 
-        assert result is None
+        assert result.holdings is None
 
     @patch("etf_holdings.requests.get")
     def test_connection_error_returns_none(self, mock_get):
@@ -232,7 +234,7 @@ class TestFetchIsharesHttpError:
 
         result = _fetch_ishares("253743")
 
-        assert result is None
+        assert result.holdings is None
 
     @patch("etf_holdings.requests.get")
     def test_timeout_returns_none(self, mock_get):
@@ -241,7 +243,7 @@ class TestFetchIsharesHttpError:
 
         result = _fetch_ishares("253743")
 
-        assert result is None
+        assert result.holdings is None
 
 
 # ---------------------------------------------------------------------------
@@ -261,7 +263,7 @@ class TestFetchIsharesNoHeader:
 
         result = _fetch_ishares("253743")
 
-        assert result is None
+        assert result.holdings is None
 
     @patch("etf_holdings.requests.get")
     def test_empty_response_returns_none(self, mock_get):
@@ -273,7 +275,7 @@ class TestFetchIsharesNoHeader:
 
         result = _fetch_ishares("253743")
 
-        assert result is None
+        assert result.holdings is None
 
 
 # ---------------------------------------------------------------------------
@@ -282,6 +284,10 @@ class TestFetchIsharesNoHeader:
 
 class TestFallbackChain:
     """Test the fallback chain: iShares → Vanguard → justETF."""
+
+    def setup_method(self):
+        """Clear the module-level singleton state between tests."""
+        _default_fetcher.clear()
 
     @patch("etf_holdings._save_cache")
     @patch("etf_holdings._load_cache")
@@ -302,7 +308,7 @@ class TestFallbackChain:
             "name": ["Apple Inc", "Microsoft Corp"],
             "weight": [8.0, 7.0],
         })
-        mock_vanguard.return_value = vanguard_df
+        mock_vanguard.return_value = FetchResult(holdings=vanguard_df, used_justetf=False)
 
         result = fetch_holdings("CSPX.L", fund_family="BlackRock")
 
@@ -324,14 +330,14 @@ class TestFallbackChain:
         mock_cache.return_value = {}
         mock_isin.return_value = "IE00B5BMR087"
         mock_product_id.return_value = None  # Product ID discovery fails
-        mock_vanguard.return_value = None  # Vanguard also fails
+        mock_vanguard.return_value = FetchResult(holdings=None, used_justetf=False)
 
         justetf_df = pd.DataFrame({
             "ticker": ["N/A", "N/A"],
             "name": ["Apple Inc", "Microsoft Corp"],
             "weight": [8.0, 7.0],
         })
-        mock_justetf.return_value = justetf_df
+        mock_justetf.return_value = FetchResult(holdings=justetf_df, used_justetf=True)
 
         result = fetch_holdings("CSPX.L", fund_family="BlackRock")
 
@@ -352,8 +358,8 @@ class TestFallbackChain:
         mock_cache.return_value = {}
         mock_isin.return_value = "IE00B5BMR087"
         mock_product_id.return_value = None
-        mock_vanguard.return_value = None
-        mock_justetf.return_value = None
+        mock_vanguard.return_value = FetchResult(holdings=None, used_justetf=False)
+        mock_justetf.return_value = FetchResult(holdings=None, used_justetf=False)
 
         result = fetch_holdings("CSPX.L", fund_family="BlackRock")
 
@@ -377,7 +383,7 @@ class TestFallbackChain:
             "name": ["Apple Inc", "Microsoft Corp"],
             "weight": [8.24, 7.15],
         })
-        mock_ishares.return_value = ishares_df
+        mock_ishares.return_value = FetchResult(holdings=ishares_df, used_justetf=False)
 
         result = fetch_holdings("CSPX.L", fund_family="BlackRock")
 
@@ -416,7 +422,7 @@ class TestFallbackChain:
             "name": ["Apple Inc"],
             "weight": [8.0],
         })
-        mock_vanguard.return_value = vanguard_df
+        mock_vanguard.return_value = FetchResult(holdings=vanguard_df, used_justetf=False)
 
         fetch_holdings("CSPX.L", fund_family="BlackRock")
 

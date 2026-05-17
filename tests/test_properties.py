@@ -288,15 +288,15 @@ def test_property_4_invalid_isins_rejected(s: str):
 
 
 # ---------------------------------------------------------------------------
-# Property 5: Name normaliser produces canonical two-word uppercase form
+# Property 5: Name normaliser produces canonical short uppercase form
 # ---------------------------------------------------------------------------
 # For any non-null, non-empty input string, the normalised output SHALL:
 # - Contain only uppercase letters, digits, and spaces
 # - Contain no corporate suffixes as whole words
-# - Consist of at most two whitespace-separated words
+# - Consist of at most three whitespace-separated words
 # And for null or empty input, the output SHALL be an empty string.
 #
-# Feature: unified-etf-portfolio, Property 5: Name normaliser produces canonical two-word uppercase form
+# Feature: unified-etf-portfolio, Property 5: Name normaliser produces canonical short uppercase form
 # Validates: Requirements 9.1, 9.2, 9.3, 9.4, 9.7
 # ---------------------------------------------------------------------------
 
@@ -318,12 +318,12 @@ def test_property_5_name_normaliser_canonical_form(name: str):
     """
     **Validates: Requirements 9.1, 9.2, 9.3, 9.4, 9.7**
 
-    Property 5: Name normaliser produces canonical two-word uppercase form.
+    Property 5: Name normaliser produces canonical short uppercase form.
 
     For any non-empty input string, the normalised output SHALL:
     - Contain only uppercase letters, digits, and spaces (regex: ^[A-Z0-9 ]*$)
     - Contain no corporate suffixes as whole words
-    - Consist of at most two whitespace-separated words
+    - Consist of at most three whitespace-separated words
     """
     result = normalise_name(name)
 
@@ -332,10 +332,10 @@ def test_property_5_name_normaliser_canonical_form(name: str):
         f"Output contains invalid characters: {result!r} for input {name!r}"
     )
 
-    # Output has at most 2 whitespace-separated words
+    # Output has at most 3 whitespace-separated words (MAX_NORMALISED_WORDS)
     words = result.split()
-    assert len(words) <= 2, (
-        f"Output has {len(words)} words (max 2): {result!r} for input {name!r}"
+    assert len(words) <= 3, (
+        f"Output has {len(words)} words (max 3): {result!r} for input {name!r}"
     )
 
     # Output does not contain any corporate suffixes as whole words
@@ -981,7 +981,7 @@ def test_property_9_merge_value_preservation(frames):
 
 from unittest.mock import patch, MagicMock
 
-from portfolio import fetch_prices
+from pricing import fetch_prices
 
 
 def _currency_code_strategy() -> st.SearchStrategy[str]:
@@ -1047,8 +1047,8 @@ def test_property_13_same_currency_no_fx_conversion(currency: str):
     mock_ticker_instance = MagicMock()
     mock_ticker_instance.info = {"currency": currency}
 
-    with patch("portfolio.yf.download", side_effect=mock_download), \
-         patch("portfolio.yf.Ticker", return_value=mock_ticker_instance):
+    with patch("pricing.yf.download", side_effect=mock_download), \
+         patch("pricing.yf.Ticker", return_value=mock_ticker_instance):
         result = fetch_prices([ticker], target_currency=currency)
 
     # The result should have the ticker with price converted at rate 1.0

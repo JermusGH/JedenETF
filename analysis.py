@@ -12,13 +12,22 @@ import pandas as pd
 
 from name_normaliser import normalise_name
 
+# If the sum of all weight values for a single ETF exceeds this threshold,
+# weights are interpreted as percentages (e.g. 8.24 means 8.24%).
+# Otherwise they are treated as decimal fractions (e.g. 0.0824 means 8.24%).
+# The value 10 was chosen because no real ETF has fewer than 10 holdings
+# summing to less than 10% total, while decimal fractions always sum to ≤ 1.
+_PERCENTAGE_WEIGHT_THRESHOLD = 10.0
+
 
 def calculate_holding_values(df: pd.DataFrame, etf_value: float) -> pd.DataFrame:
     """
     Apply the weight interpretation heuristic and calculate holding values.
 
-    If weights sum > 10, treat as percentages: value = (weight / 100) * etf_value.
-    If weights sum <= 10, treat as decimal fractions: value = weight * etf_value.
+    If weights sum > _PERCENTAGE_WEIGHT_THRESHOLD (10), treat as percentages:
+        value = (weight / 100) * etf_value.
+    If weights sum <= threshold, treat as decimal fractions:
+        value = weight * etf_value.
 
     Parameters
     ----------
@@ -34,7 +43,7 @@ def calculate_holding_values(df: pd.DataFrame, etf_value: float) -> pd.DataFrame
     """
     result = df.copy()
     weight_sum = result["weight"].sum()
-    if weight_sum > 10:
+    if weight_sum > _PERCENTAGE_WEIGHT_THRESHOLD:
         result["value"] = (result["weight"] / 100.0) * etf_value
     else:
         result["value"] = result["weight"] * etf_value
